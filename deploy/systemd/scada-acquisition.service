@@ -1,0 +1,40 @@
+[Unit]
+Description=SCADA MVP: служба сбора данных (опрос устройств, тревоги, архив, команды)
+Documentation=file:///opt/scada/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=scada
+Group=scada
+WorkingDirectory=/opt/scada/acquisition
+ExecStart=/opt/scada/acquisition/scada-acquisition
+EnvironmentFile=/etc/scada/scada.env
+Environment=DOTNET_ENVIRONMENT=Production
+
+# Перезапуск при любом сбое; останов не дольше 20 с (досылка архива в буфер)
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+# Опрос оборудования — приоритетнее веб-интерфейса
+Nice=-5
+
+# Изоляция
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+StateDirectory=scada
+ReadWritePaths=/var/lib/scada
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

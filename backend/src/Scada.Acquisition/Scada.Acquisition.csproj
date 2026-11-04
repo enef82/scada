@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <!--
+    Служба сбора данных: опрос устройств, обработка тегов, тревоги, архив, исполнение команд.
+    Отдельный процесс: перезапуск веб-приложения не останавливает опрос оборудования.
+    Сборка без OPC UA (например, до решения по лицензии): dotnet build -p:ScadaOpcUa=false
+  -->
+  <PropertyGroup>
+    <AssemblyName>scada-acquisition</AssemblyName>
+    <RootNamespace>Scada.Acquisition</RootNamespace>
+    <ScadaOpcUa Condition="'$(ScadaOpcUa)' == ''">true</ScadaOpcUa>
+    <DefineConstants Condition="'$(ScadaOpcUa)' == 'true'">$(DefineConstants);OPCUA</DefineConstants>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Scada.Core\Scada.Core.csproj" />
+    <ProjectReference Include="..\Scada.Drivers\Scada.Drivers.csproj" />
+    <ProjectReference Include="..\Scada.Drivers.OpcUa\Scada.Drivers.OpcUa.csproj" Condition="'$(ScadaOpcUa)' == 'true'" />
+  </ItemGroup>
+</Project>

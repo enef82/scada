@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Драйвер OPC UA на официальном стеке OPC Foundation.
+    ВНИМАНИЕ: стек распространяется по двойной лицензии (RCL для членов OPC Foundation / GPL-2.0).
+    Для закрытого коммерческого продукта до релиза требуется решение по лицензии
+    (членство в OPC Foundation или коммерческий SDK). Драйвер изолирован в отдельной сборке,
+    чтобы его можно было заменить без изменений остальной системы.
+  -->
+  <ItemGroup>
+    <PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Client" Version="1.5.376.244" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Scada.Drivers\Scada.Drivers.csproj" />
+  </ItemGroup>
+</Project>

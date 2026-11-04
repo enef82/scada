@@ -1,0 +1,13 @@
+bin/
+obj/
+node_modules/
+dist/
+backend/src/Scada.Web/wwwroot/
+*.user
+.vs/
+.idea/
+dist-demo/
+
+.env
+*.env
+!deploy/scada.env.example

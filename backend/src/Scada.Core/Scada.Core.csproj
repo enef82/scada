@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Домен, доступ к БД, LISTEN/NOTIFY, движок тревог. Общий для обоих процессов. -->
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="9.0.3" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,5 @@
+# Добавляет демонстрационные данные (КНС-1 на симуляторе) при первой инициализации БД.
+services:
+  db:
+    volumes:
+      - ./db/002_demo.sql:/docker-entrypoint-initdb.d/002_demo.sql:ro

@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Контракт драйверов + встроенные драйверы без внешних зависимостей: Modbus TCP и симулятор. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Scada.Core\Scada.Core.csproj" />
+  </ItemGroup>
+</Project>

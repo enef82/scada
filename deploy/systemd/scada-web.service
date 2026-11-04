@@ -1,0 +1,33 @@
+[Unit]
+Description=SCADA MVP: веб-приложение (API, SignalR, интерфейс оператора)
+Documentation=file:///opt/scada/README.md
+After=network-online.target postgresql.service scada-acquisition.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=scada
+Group=scada
+WorkingDirectory=/opt/scada/web
+ExecStart=/opt/scada/web/scada-web
+EnvironmentFile=/etc/scada/scada.env
+Environment=ASPNETCORE_ENVIRONMENT=Production
+
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

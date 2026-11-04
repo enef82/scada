@@ -1,0 +1,47 @@
+# Опциональный запуск в контейнерах:  docker compose up -d --build
+# С демонстрационными данными:        docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+# Интерфейс: http://localhost:8080  (admin / пароль из SCADA_ADMIN_PASSWORD, смена при первом входе)
+
+services:
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: scada
+      POSTGRES_USER: scada
+      POSTGRES_PASSWORD: ${SCADA_DB_PASSWORD:-scada_dev_password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./db/004_publication.sql:/docker-entrypoint-initdb.d/004_publication.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scada -d scada"]
+      interval: 5s
+      retries: 20
+
+  acquisition:
+    build: { context: ., target: acquisition }
+    restart: always
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      ConnectionStrings__Scada: Host=db;Database=scada;Username=scada;Password=${SCADA_DB_PASSWORD:-scada_dev_password}
+      Acquisition__SpoolPath: /var/lib/scada/spool
+    volumes:
+      - spool:/var/lib/scada
+    # для опроса ПЛК в технологической сети часто удобнее network_mode: host
+    stop_grace_period: 20s
+
+  web:
+    build: { context: ., target: web }
+    restart: always
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      ConnectionStrings__Scada: Host=db;Database=scada;Username=scada;Password=${SCADA_DB_PASSWORD:-scada_dev_password}
+      Scada__InitialAdminPassword: ${SCADA_ADMIN_PASSWORD:-admin12345}
+      Kestrel__Endpoints__Http__Url: http://0.0.0.0:8080
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
+  spool:
