@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { api } from './api';
 import { onRealtime } from './realtime';
-import type { Device, DraftStatus, Me, MnemoInfo, Role, Tag } from './types';
+import type { Area, Device, DraftStatus, Me, MnemoInfo, Perm, Tag } from './types';
 
 // ------------------------------------------------------------------ авторизация
 interface AuthState {
@@ -40,13 +40,49 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
 }));
 
-const rank: Record<Role, number> = { viewer: 0, operator: 1, engineer: 2, admin: 3 };
-
-/** Есть ли у текущего пользователя роль не ниже требуемой. */
-export function useCan(min: Role): boolean {
-  const role = useAuth((s) => s.me?.role);
-  return role !== undefined && rank[role] >= rank[min];
+/** Есть ли право (в указанной области или хотя бы в одной). */
+export function hasPerm(me: Me | null | undefined, perm: Perm, areaId?: number | null): boolean {
+  const p = me?.permissions?.[perm];
+  if (!p) return false;
+  if (p === 'all') return true;
+  if (areaId === undefined || areaId === null) return p.length > 0;
+  return p.includes(areaId);
 }
+
+/** Хук: право в области (или хотя бы в одной; несколько кодов — любое из них). */
+export function useCan(perm: Perm | Perm[], areaId?: number | null): boolean {
+  const me = useAuth((s) => s.me);
+  return (Array.isArray(perm) ? perm : [perm]).some((p) => hasPerm(me, p, areaId));
+}
+
+/** Функция проверки для списков (без хука на каждую строку). */
+export function usePerms(): (perm: Perm, areaId?: number | null) => boolean {
+  const me = useAuth((s) => s.me);
+  return (perm, areaId) => hasPerm(me, perm, areaId);
+}
+
+/** Право на команду по тегу: класс и тип задают нужное право. */
+export function commandPerm(tag: Pick<Tag, 'commandClass' | 'dataType'>): Perm {
+  return tag.commandClass === 'critical' ? 'cmd.critical' : tag.dataType === 'bool' ? 'cmd.control' : 'cmd.setpoint';
+}
+
+// ------------------------------------------------------------------ области
+interface AreasState {
+  areas: Area[];
+  byId: Map<number, Area>;
+  reload: () => Promise<void>;
+}
+
+export const useAreas = create<AreasState>((set) => ({
+  areas: [],
+  byId: new Map(),
+  reload: async () => {
+    const areas = await api.get<Area[]>('/api/areas');
+    set({ areas, byId: new Map(areas.map((a) => [a.id, a])) });
+  },
+}));
+
+export const areaPath = (id: number | null | undefined) => (id ? useAreas.getState().byId.get(id)?.path ?? `#${id}` : '—');
 
 // ------------------------------------------------------------------ метаданные (теги, устройства, схемы)
 interface MetaState {

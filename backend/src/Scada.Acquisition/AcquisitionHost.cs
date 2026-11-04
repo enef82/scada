@@ -200,6 +200,7 @@ public sealed class AcquisitionHost : BackgroundService
                 try
                 {
                     foreach (var w in _devices.Workers) await WriteDeviceStatusAsync(w.Diagnostics, ct);
+                    await _commands.ExpireAwaitingAsync(ct);
                     var hb = new HeartbeatPayload(
                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _engine.TagCount, _devices.Workers.Count,
                         _historian.QueueLength, _historian.SpoolBytes, _loadedVersion);

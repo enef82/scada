@@ -9,7 +9,7 @@ const ANALOG: AlarmKind[] = ['hihi', 'hi', 'lo', 'lolo'];
 
 export function AlarmDefsPage() {
   const tagById = useMeta((s) => s.tagById);
-  const can = useCan('engineer');
+  const can = useCan('config.edit');
   const [defs, setDefs] = useState<AlarmDef[]>([]);
   const [q, setQ] = useState('');
   const [edit, setEdit] = useState<Partial<AlarmDef> | null>(null);

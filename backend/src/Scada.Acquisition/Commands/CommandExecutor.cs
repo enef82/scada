@@ -14,7 +14,10 @@ namespace Scada.Acquisition.Commands;
 ///  * команда захватывается атомарно (pending → executing), исполняется не более одного раза;
 ///  * истёкшая команда (expires_at ≤ now) не исполняется никогда — в т.ч. после восстановления связи;
 ///  * автоматических повторов записи нет;
-///  * после записи — контрольное чтение, результат фиксируется в таблице commands.
+///  * после записи — контрольное чтение, результат фиксируется в таблице commands;
+///  * команда на теге класса «Критичный» исполняется только при наличии второго подтверждения в БД
+///    (другой пользователь, другой сеанс) или номера наряда в режиме «один дежурный» — проверка здесь,
+///    а не только в веб-приложении.
 /// </summary>
 public sealed class CommandExecutor
 {
@@ -45,10 +48,20 @@ public sealed class CommandExecutor
                                  THEN 'прервана перезапуском службы сбора, результат неизвестен'
                                  ELSE 'истёк срок до запуска службы сбора' END,
                    finished_at = now()
-            WHERE status = 'executing' OR (status = 'pending' AND expires_at <= now())
+            WHERE status = 'executing' OR (status IN ('pending','awaiting_confirm') AND expires_at <= now())
             """);
         var n = await cmd.ExecuteNonQueryAsync(ct);
         if (n > 0) _log.LogWarning("Закрыто незавершённых команд прошлого запуска: {Count}", n);
+    }
+
+    /// <summary>Критичные команды без второго подтверждения за отведённое время — истекают (вызывается периодически).</summary>
+    public async Task ExpireAwaitingAsync(CancellationToken ct)
+    {
+        await using var cmd = _ds.CreateCommand(
+            "UPDATE commands SET status = 'expired', result = 'не подтверждена вторым пользователем в отведённое время', finished_at = now() " +
+            "WHERE status = 'awaiting_confirm' AND expires_at <= now()");
+        var n = await cmd.ExecuteNonQueryAsync(ct);
+        if (n > 0) _log.LogWarning("Критичных команд без второго подтверждения истекло: {Count}", n);
     }
 
     /// <summary>Обработка всех pending-команд (после переподключения LISTEN или по уведомлению).</summary>
@@ -75,14 +88,19 @@ public sealed class CommandExecutor
         long tagId;
         double? num;
         string? str;
-        string user;
+        string user, cmdClass;
+        string? confirmMode, permitCode;
+        bool secondConfirmed;
         await using (var claim = _ds.CreateCommand(
             """
             UPDATE commands SET status = CASE WHEN expires_at > now() THEN 'executing' ELSE 'expired' END,
                    result = CASE WHEN expires_at > now() THEN NULL ELSE 'истёк срок жизни команды' END,
                    finished_at = CASE WHEN expires_at > now() THEN NULL ELSE now() END
             WHERE id = $1 AND status = 'pending'
-            RETURNING status, tag_id, value_num, value_str, requested_by
+            RETURNING status, tag_id, value_num, value_str, requested_by, command_class, confirm_mode, permit_code,
+                      EXISTS (SELECT 1 FROM command_confirmations c
+                              WHERE c.command_id = commands.id AND lower(c.user_login) <> lower(commands.requested_by)
+                                AND c.session_id IS DISTINCT FROM commands.requested_session)
             """))
         {
             claim.Parameters.Add(Db.P(id));
@@ -97,6 +115,10 @@ public sealed class CommandExecutor
             num = r.GetNullableDouble(2);
             str = r.GetNullableString(3);
             user = r.GetString(4);
+            cmdClass = r.GetString(5);
+            confirmMode = r.GetNullableString(6);
+            permitCode = r.GetNullableString(7);
+            secondConfirmed = r.GetBoolean(8);
         }
 
         string status, result;
@@ -104,6 +126,10 @@ public sealed class CommandExecutor
         string? rbStr = null;
         try
         {
+            // класс берётся из опубликованной конфигурации службы: подменить его в строке команды нельзя
+            var critical = cmdClass == "critical" || (_engine.TryGetTag((int)tagId, out var def) && def.CommandClass == CommandClass.Critical);
+            if (critical && !secondConfirmed && !(confirmMode == "permit" && !string.IsNullOrWhiteSpace(permitCode)))
+                throw new CommandRejectedException("критичная команда без второго подтверждения не исполняется");
             (rbNum, rbStr, result) = await DoWriteAsync((int)tagId, num, str, ct);
             status = "done";
             _log.LogInformation("Команда {Id} от {User}: тег {Tag} ← {Value} — выполнено",

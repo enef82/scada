@@ -6,6 +6,9 @@ public enum TagDataType { Bool, Int16, UInt16, Int32, UInt32, Float32, Float64, 
 
 public enum ArchiveMode { None, Change, Interval }
 
+/// <summary>Класс критичности команды на записываемом теге: какое право нужно и как подтверждать.</summary>
+public enum CommandClass { Normal, Important, Critical }
+
 public static class EnumCodes
 {
     public static Protocol ParseProtocol(string s) => s switch
@@ -48,6 +51,20 @@ public static class EnumCodes
     };
 
     public static bool IsNumeric(this TagDataType t) => t != TagDataType.String;
+
+    public static CommandClass ParseCommandClass(string? s) => s switch
+    {
+        "important" => CommandClass.Important,
+        "critical" => CommandClass.Critical,
+        _ => CommandClass.Normal,
+    };
+
+    public static string ToCode(this CommandClass c) => c switch
+    {
+        CommandClass.Important => "important",
+        CommandClass.Critical => "critical",
+        _ => "normal",
+    };
 }
 
 public sealed record DeviceDefinition
@@ -62,6 +79,8 @@ public sealed record DeviceDefinition
     public int PollMs { get; init; } = 1000;
     public int TimeoutMs { get; init; } = 2000;
     public string Description { get; init; } = "";
+    /// <summary>Область (узел дерева объектов); 1 — корень установки.</summary>
+    public int AreaId { get; init; } = 1;
 }
 
 public sealed record TagDefinition
@@ -88,6 +107,9 @@ public sealed record TagDefinition
     public double? WriteMax { get; init; }
     public bool WriteConfirm { get; init; } = true;
     public bool Enabled { get; init; } = true;
+    /// <summary>Собственная область тега; null — область устройства.</summary>
+    public int? AreaId { get; init; }
+    public CommandClass CommandClass { get; init; } = CommandClass.Normal;
 
     public bool HasScaling =>
         RawLow is not null && RawHigh is not null && EngLow is not null && EngHigh is not null

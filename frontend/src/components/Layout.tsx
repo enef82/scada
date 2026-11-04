@@ -2,18 +2,27 @@ import { useState, type ReactNode } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { api, errorText } from '../lib/api';
 import { useAlarms } from '../lib/alarms';
-import { formatTime, priorityNames, roleNames } from '../lib/format';
-import { useAcquisitionAlive, useNow, useRtStatus } from '../lib/realtime';
+import { formatTime, priorityNames } from '../lib/format';
+import { useAcquisitionAlive, useNow, useRealtimeEvent, useRtStatus } from '../lib/realtime';
 import { toast, useAuth, useCan, useDraft } from '../lib/stores';
-import { CommandDialog } from './CommandDialog';
+import { CommandDialog, ConfirmRequests } from './CommandDialog';
 import { ConfirmHost, Field, Modal, Toasts } from './ui';
 import { useEffect } from 'react';
 
 export function Layout({ children }: { children: ReactNode }) {
   const me = useAuth((s) => s.me);
   const logout = useAuth((s) => s.logout);
-  const canEng = useCan('engineer');
-  const isAdmin = useCan('admin');
+  const canConfig = useCan('config.edit');
+  const canMnemo = useCan('mnemo.edit');
+  const canEng = useCan(['config.edit', 'mnemo.edit', 'config.publish']);
+  const canAudit = useCan('audit.view');
+  const canAccess = useCan(['users.manage', 'config.edit']);
+  const canUsers = useCan('users.manage');
+  // системные оповещения (вход аварийной учётной записью и т. п.)
+  useRealtimeEvent('systemNotice', (p) => {
+    const n = p as { level: string; text: string };
+    if (canAudit || canUsers) toast.error(n.text);
+  });
   const navigate = useNavigate();
   const [pwd, setPwd] = useState(false);
 
@@ -26,32 +35,29 @@ export function Layout({ children }: { children: ReactNode }) {
           <NavLink to="/alarms">Тревоги</NavLink>
           <NavLink to="/trends">Тренды</NavLink>
           <NavLink to="/events">Журналы</NavLink>
-          {canEng && (
-            <>
-              <span className="nav-sep" />
-              <NavLink to="/eng/devices">Устройства</NavLink>
-              <NavLink to="/eng/tags">Теги</NavLink>
-              <NavLink to="/eng/alarms">Уставки тревог</NavLink>
-              <NavLink to="/eng/mnemos">Редактор схем</NavLink>
-              <NavLink to="/eng/publish">Публикация</NavLink>
-              <NavLink to="/eng/audit">Аудит</NavLink>
-            </>
-          )}
-          {isAdmin && <NavLink to="/admin/users">Пользователи</NavLink>}
+          {(canEng || canAudit || canAccess) && <span className="nav-sep" />}
+          {canConfig && <NavLink to="/eng/devices">Устройства</NavLink>}
+          {canConfig && <NavLink to="/eng/tags">Теги</NavLink>}
+          {canConfig && <NavLink to="/eng/alarms">Уставки тревог</NavLink>}
+          {canMnemo && <NavLink to="/eng/mnemos">Редактор схем</NavLink>}
+          {canEng && <NavLink to="/eng/publish">Публикация</NavLink>}
+          {canAudit && <NavLink to="/eng/audit">Аудит</NavLink>}
+          {canAccess && <NavLink to={canUsers ? '/admin/users' : '/admin/areas'}>Доступ</NavLink>}
           <NavLink to="/diagnostics">Диагностика</NavLink>
         </nav>
         {canEng && <DraftPlaque />}
         <StatusIndicators />
         <Clock />
-        <div className="user" title={`${me?.displayName ?? ''} — сменить пароль`}>
-          <button className="link-btn" onClick={() => setPwd(true)}>{me?.login}</button>
-          <small>{roleNames[me?.role ?? '']}</small>
+        <div className="user" title={`${me?.displayName ?? ''}\n${(me?.roles ?? []).join(', ') || 'нет назначенных ролей'}${me?.groups?.length ? `\nГруппы AD: ${me.groups.join(', ')}` : ''}`}>
+          <button className="link-btn" onClick={() => me?.source === 'ad' ? toast.info('Пароль доменной учётной записи меняется в Windows') : setPwd(true)}>{me?.login}</button>
+          <small>{me?.emergency ? <span className="pill pill-bad">аварийная</span> : me?.roles?.length === 1 ? me.roles[0] : me?.roles?.length ? `ролей: ${me.roles.length}` : 'нет прав'}</small>
           <button className="link-btn" onClick={() => void logout().then(() => navigate('/login'))}>Выход</button>
         </div>
       </header>
       <main className="main">{children}</main>
       <AlarmBanner />
       <CommandDialog />
+      <ConfirmRequests />
       <ConfirmHost />
       <Toasts />
       {(pwd || me?.mustChangePassword) && <ChangePassword forced={!!me?.mustChangePassword} onClose={() => setPwd(false)} />}

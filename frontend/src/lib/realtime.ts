@@ -27,7 +27,7 @@ interface RtStatus {
 export const useRtStatus = create<RtStatus>(() => ({ link: 'connecting', heartbeatAt: null, heartbeat: null }));
 
 type Listener = () => void;
-type EventName = 'alarm' | 'command' | 'device' | 'config' | 'resync' | 'published' | 'configApplied';
+type EventName = 'alarm' | 'command' | 'device' | 'config' | 'resync' | 'published' | 'configApplied' | 'confirmRequest' | 'systemNotice';
 
 const values = new Map<number, TagValueTuple>();
 const tagListeners = new Map<number, Set<Listener>>();
@@ -52,7 +52,7 @@ function emitTag(id: number) {
   tagListeners.get(id)?.forEach((l) => l());
 }
 
-function emit(name: EventName, payload?: unknown) {
+export function emit(name: EventName, payload?: unknown) {
   eventListeners.get(name)?.forEach((l) => l(payload));
 }
 
@@ -92,6 +92,8 @@ export function startRealtime() {
   conn.on('config', (p) => emit('config', p));
   conn.on('published', (p) => emit('published', p));
   conn.on('configApplied', (p) => emit('configApplied', p));
+  conn.on('confirmRequest', (p) => emit('confirmRequest', p));
+  conn.on('systemNotice', (p) => emit('systemNotice', p));
   conn.on('resync', () => {
     emit('resync');
     scheduleResubscribe();

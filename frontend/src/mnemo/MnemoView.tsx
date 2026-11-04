@@ -5,14 +5,15 @@ import { requestCommand } from '../components/CommandDialog';
 import { useAlarms } from '../lib/alarms';
 import { formatValue, qualityCategory, qualityName } from '../lib/format';
 import { useTagSubscription, useTagValue } from '../lib/realtime';
-import { useCan, useMeta } from '../lib/stores';
+import { commandPerm, useCan, useMeta } from '../lib/stores';
 import { ElementView, SvgDefs, type RenderCtx } from './elements';
 import { boundTagNames, str, type MnemoDoc, type MnemoElement } from './model';
 
 /** Исполнение мнемосхемы (АРМ оператора). */
 export function MnemoView({ doc, subscriptionKey = 'mnemo' }: { doc: MnemoDoc; subscriptionKey?: string }) {
   const navigate = useNavigate();
-  const canOperate = useCan('operator');
+  // кнопки управления активны при любом праве на команды; право на конкретный тег проверяет диалог команды и сервер
+  const canOperate = useCan(['cmd.control', 'cmd.setpoint', 'cmd.critical']);
   const tagByName = useMeta((s) => s.tagByName);
   const [faceplate, setFaceplate] = useState<MnemoElement | null>(null);
 
@@ -57,9 +58,9 @@ function StateRow({ label, tagName }: { label: string; tagName: string }) {
 /** Панель управления оборудованием (faceplate). */
 function Faceplate({ el, onClose }: { el: MnemoElement; onClose: () => void }) {
   const navigate = useNavigate();
-  const can = useCan('operator');
   const byName = useMeta((s) => s.tagByName);
   const cmd = byName.get(str(el.props.cmdTag));
+  const can = useCan(cmd ? commandPerm(cmd) : 'cmd.control', cmd?.effectiveAreaId ?? 0);
   const state = byName.get(str(el.props.stateTag));
   const fault = byName.get(str(el.props.faultTag));
   const alarmsByTag = useAlarms((s) => s.byTag);

@@ -14,6 +14,8 @@ public static class PgChannels
     public const string AlarmAck = "scada_alarm_ack";
     public const string Command = "scada_command";
     public const string CommandDone = "scada_command_done";
+    /// <summary>Критичная команда ждёт второго подтверждения (payload — id команды).</summary>
+    public const string CommandConfirm = "scada_command_confirm";
     /// <summary>Опубликована новая версия конфигурации (payload — номер версии).</summary>
     public const string Config = "scada_config";
     /// <summary>Служба сбора применила версию: {"version":N,"ms":..}.</summary>

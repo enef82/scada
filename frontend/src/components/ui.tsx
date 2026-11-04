@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useMeta, useToasts } from '../lib/stores';
-import type { Tag } from '../lib/types';
+import { useAreas, useAuth, hasPerm, useMeta, useToasts } from '../lib/stores';
+import type { Area, Perm, Tag } from '../lib/types';
 
 export function Modal(props: {
   title: string;
@@ -174,5 +174,48 @@ export function ConfirmHost() {
       </>}>
       <p style={{ margin: 0, whiteSpace: 'pre-line' }}>{req.text}</p>
     </Modal>
+  );
+}
+
+/** Порядок «дерево»: родитель, затем дети; depth — для отступа. */
+export function areaTree(areas: Area[]): { area: Area; depth: number }[] {
+  const children = new Map<number | null, Area[]>();
+  for (const a of areas) children.set(a.parentId, [...(children.get(a.parentId) ?? []), a]);
+  const out: { area: Area; depth: number }[] = [];
+  const seen = new Set<number>();
+  const walk = (parent: number | null, depth: number) => {
+    for (const a of (children.get(parent) ?? []).sort((x, y) => x.sortOrder - y.sortOrder || x.name.localeCompare(y.name))) {
+      if (seen.has(a.id)) continue;
+      seen.add(a.id);
+      out.push({ area: a, depth });
+      walk(a.id, depth + 1);
+    }
+  };
+  walk(null, 0);
+  return out;
+}
+
+/**
+ * Выбор области. Показываются области, где у пользователя есть право perm
+ * (текущее значение остаётся в списке, даже если права на него нет).
+ */
+export function AreaSelect(props: {
+  value: number | null | undefined;
+  onChange: (v: number | null) => void;
+  perm?: Perm;
+  /** подпись пустого варианта, например «как у устройства»; без неё пустой вариант не показывается */
+  inherit?: string;
+  id?: string;
+}) {
+  const areas = useAreas((s) => s.areas);
+  const me = useAuth((s) => s.me);
+  const items = areaTree(areas).filter(({ area }) => !props.perm || hasPerm(me, props.perm, area.id) || area.id === props.value);
+  return (
+    <select id={props.id} value={props.value ?? ''} onChange={(e) => props.onChange(e.target.value === '' ? null : Number(e.target.value))}>
+      {props.inherit !== undefined && <option value="">{props.inherit}</option>}
+      {items.map(({ area, depth }) => (
+        <option key={area.id} value={area.id}>{'\u00a0\u00a0'.repeat(depth)}{area.name}</option>
+      ))}
+    </select>
   );
 }

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Npgsql;
+using Scada.Core.Access;
 using Scada.Core.Config;
 using Scada.Core.Data;
 using Scada.Drivers.Validation;
@@ -19,14 +20,14 @@ public sealed record PublishRequest(int BaseVersion, string? Comment, string? Pa
 public sealed record RollbackRequest(string? Comment, string? Password, bool AcceptWarnings, bool DiscardDraft);
 public sealed record DiscardRequest(string? Password);
 
-public sealed record ChangeWithAuthors(ChangeItem Change, string[] Authors, DateTime? LastAt);
+public sealed record ChangeWithAuthors(ChangeItem Change, string[] Authors, DateTime? LastAt, string[] Areas, bool CanPublish);
 
 /// <summary>
 /// Черновик → проверка → применение → откат. Публикация и откат идут под одной блокировкой
 /// (advisory lock 'scada.publish') и проверяют номер базовой версии — два инженера
 /// не могут опубликовать «поверх» друг друга.
 /// </summary>
-public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Audit audit, IOptions<PublishOptions> options)
+public sealed class PublishService(NpgsqlDataSource ds, Credentials credentials, AccessService access, Audit audit, IOptions<PublishOptions> options)
 {
     private readonly PublishOptions _opt = options.Value;
 
@@ -48,7 +49,29 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
         ConfigSnapshot draft, ConfigSnapshot published, CancellationToken ct)
     {
         var docs = await DraftStore.LoadMnemoDocsAsync(conn, tx, draft.Mnemos, ct);
-        return ConfigValidator.Validate(draft, published, docs, new ValidationOptions { ArchiveRowsPerDayLimit = _opt.ArchiveRowsPerDayLimit });
+        var areas = (await access.ModelAsync(ct)).Tree.Nodes.Select(n => n.Id).ToHashSet();
+        return ConfigValidator.Validate(draft, published, docs,
+            new ValidationOptions { ArchiveRowsPerDayLimit = _opt.ArchiveRowsPerDayLimit, KnownAreas = areas });
+    }
+
+    /// <summary>Публикация требует права «Публикация» на все области, затронутые черновиком.</summary>
+    private async Task<IResult?> CheckAreasAsync(HttpContext http, List<ChangeItem> changes, ConfigSnapshot prev, ConfigSnapshot next,
+        string action, CancellationToken ct)
+    {
+        var perms = await access.ForAsync(http.User, ct);
+        var tree = (await access.ModelAsync(ct)).Tree;
+        var foreign = changes
+            .Select(c => (c, areas: ConfigDiff.ChangeAreas(c, prev, next).Where(a => !perms.Has(Perm.ConfigPublish, a)).ToArray()))
+            .Where(x => x.areas.Length > 0)
+            .Select(x => new { x.c.ObjectType, x.c.Id, x.c.Name, areas = x.areas.Select(tree.Path).ToArray() })
+            .ToList();
+        if (foreign.Count == 0) return null;
+        await audit.WriteAsync(http, "publish_denied", "config", new { reason = "areas", action, foreign });
+        return Results.Json(new
+        {
+            title = $"Нет права «Публикация» на области изменений ({foreign.Count}). Их должен опубликовать инженер с нужными правами.",
+            foreign,
+        }, statusCode: 403);
     }
 
     private static async Task<Dictionary<(string, int), (string[] Users, DateTime At)>> AuthorsAsync(
@@ -80,7 +103,7 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
         };
     }
 
-    public async Task<object> DiffAsync(CancellationToken ct)
+    public async Task<object> DiffAsync(HttpContext http, CancellationToken ct)
     {
         await using var conn = await ds.OpenConnectionAsync(ct);
         var (version, published) = await PublishedAsync(conn, null, ct);
@@ -88,6 +111,8 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
         var changes = ConfigDiff.Compute(published, draft);
         var authors = await AuthorsAsync(conn, null, ct);
         var issues = await ValidateAsync(conn, null, draft, published, ct);
+        var perms = await access.ForAsync(http.User, ct);
+        var tree = (await access.ModelAsync(ct)).Tree;
         return new
         {
             baseVersion = version,
@@ -95,7 +120,9 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
             changes = changes.Select(c =>
             {
                 var a = authors.GetValueOrDefault((c.ObjectType, c.Id));
-                return new ChangeWithAuthors(c, a.Users ?? [], a.Users is null ? null : a.At);
+                var areas = ConfigDiff.ChangeAreas(c, published, draft);
+                return new ChangeWithAuthors(c, a.Users ?? [], a.Users is null ? null : a.At,
+                    areas.Select(tree.Path).ToArray(), areas.All(x => perms.Has(Perm.ConfigPublish, x)));
             }),
             errors = issues.Where(i => i.Level == ValidationIssue.Error),
             warnings = issues.Where(i => i.Level == ValidationIssue.Warning),
@@ -104,8 +131,7 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
 
     private async Task<IResult?> CheckPasswordAsync(HttpContext http, string? password, CancellationToken ct)
     {
-        var hash = (string?)await ds.ScalarAsync("SELECT password_hash FROM users WHERE login = $1 AND enabled", ct, http.User.Login());
-        if (hash is null || string.IsNullOrEmpty(password) || !passwords.Verify(hash, password))
+        if (!await credentials.VerifyAsync(http.User.Login(), password, ct))
         {
             await audit.WriteAsync(http, "publish_denied", "config", new { reason = "password" });
             return Results.Problem("Неверный пароль. Для публикации повторно введите свой пароль.", statusCode: 403);
@@ -121,6 +147,8 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
         var changes = ConfigDiff.Compute(published, draft);
         if (changes.Count == 0)
             return Results.Problem("В черновике нет изменений относительно опубликованной версии.", statusCode: 400);
+
+        if (await CheckAreasAsync(http, changes, published, draft, rollbackOf is null ? "publish" : "rollback", ct) is { } denied) return denied;
 
         var issues = await ValidateAsync(conn, tx, draft, published, ct);
         var errors = issues.Where(i => i.Level == ValidationIssue.Error).ToList();
@@ -211,6 +239,7 @@ public sealed class PublishService(NpgsqlDataSource ds, Passwords passwords, Aud
         var (version, published) = await PublishedAsync(conn, tx, ct);
         var draft = await DraftStore.LoadDraftAsync(conn, tx, ct);
         var changes = ConfigDiff.Compute(published, draft);
+        if (await CheckAreasAsync(http, changes, published, draft, "discard", ct) is { } areaDenied) return areaDenied;
         string[] authors;
         await using (var a = new NpgsqlCommand("SELECT coalesce(array_agg(DISTINCT user_login), '{}') FROM draft_changes", conn, tx))
             authors = (string[])(await a.ExecuteScalarAsync(ct))!;
@@ -228,16 +257,21 @@ public static class PublishApi
 {
     public static void Map(RouteGroupBuilder api)
     {
+        var engineer = Policies.Of(Perm.ConfigEdit, Perm.MnemoEdit, Perm.ConfigPublish);
+        var publisher = Policies.Of(Perm.ConfigPublish);
         api.MapGet("/draft/status", (PublishService svc, CancellationToken ct) => svc.StatusAsync(ct))
-            .RequireAuthorization(Roles.CanView);
-        api.MapGet("/draft/diff", (PublishService svc, CancellationToken ct) => svc.DiffAsync(ct))
-            .RequireAuthorization(Roles.CanEngineer);
+            .RequireAuthorization(Policies.Of(Perm.View));
+        api.MapGet("/draft/diff", (HttpContext http, PublishService svc, CancellationToken ct) => svc.DiffAsync(http, ct))
+            .RequireAuthorization(engineer);
+        // проверки без публикации (кнопка «Проверить»)
+        api.MapPost("/draft/validate", (HttpContext http, PublishService svc, CancellationToken ct) => svc.DiffAsync(http, ct))
+            .RequireAuthorization(engineer);
         api.MapPost("/draft/discard", (DiscardRequest req, HttpContext http, PublishService svc, CancellationToken ct) =>
-            svc.DiscardAsync(req, http, ct)).RequireAuthorization(Roles.CanEngineer);
+            svc.DiscardAsync(req, http, ct)).RequireAuthorization(publisher);
         api.MapPost("/publish", (PublishRequest req, HttpContext http, PublishService svc, CancellationToken ct) =>
-            svc.PublishAsync(req, http, ct)).RequireAuthorization(Roles.CanEngineer);
+            svc.PublishAsync(req, http, ct)).RequireAuthorization(publisher);
         api.MapPost("/versions/{n:int}/rollback", (int n, RollbackRequest req, HttpContext http, PublishService svc, CancellationToken ct) =>
-            svc.RollbackAsync(n, req, http, ct)).RequireAuthorization(Roles.CanEngineer);
+            svc.RollbackAsync(n, req, http, ct)).RequireAuthorization(publisher);
 
         api.MapGet("/versions", async (int? limit, NpgsqlDataSource ds, CancellationToken ct) =>
             await ds.QueryAsync(
@@ -250,7 +284,7 @@ public static class PublishApi
                     summary = ConfigDiff.Summary(JsonSerializer.Deserialize<List<ChangeItem>>(r.GetString(7), ConfigSnapshot.Json) ?? []),
                     warnings = r.GetInt32(8),
                 }, ct, Math.Clamp(limit ?? 100, 1, 1000)))
-            .RequireAuthorization(Roles.CanEngineer);
+            .RequireAuthorization(engineer);
 
         api.MapGet("/versions/{n:int}", async (int n, NpgsqlDataSource ds, CancellationToken ct) =>
         {
@@ -265,6 +299,6 @@ public static class PublishApi
                     warnings = JsonSerializer.Deserialize<JsonElement>(r.GetString(8)),
                 }, ct, n);
             return v is null ? Results.NotFound() : Results.Ok(v);
-        }).RequireAuthorization(Roles.CanEngineer);
+        }).RequireAuthorization(engineer);
     }
 }

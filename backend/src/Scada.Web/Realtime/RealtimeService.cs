@@ -15,13 +15,17 @@ namespace Scada.Web.Realtime;
 /// Хаб реального времени. Клиент подписывается только на теги открытого экрана
 /// и сразу получает их текущий снимок. Изменения рассылаются пачками не чаще FlushIntervalMs.
 /// </summary>
-[Authorize(Policy = Roles.CanView)]
-public sealed class RealtimeHub(RealtimeService rt) : Hub
+[Authorize(Policy = Policies.Prefix + Scada.Core.Access.Perm.View)]
+public sealed class RealtimeHub(RealtimeService rt, AccessService access) : Hub
 {
-    public object[][] Subscribe(int[] tagIds)
+    /// <summary>Подписка фильтруется по областям: значения тегов чужих областей не отправляются.</summary>
+    public async Task<object[][]> Subscribe(int[] tagIds)
     {
-        rt.Subscribe(Context.ConnectionId, tagIds);
-        return rt.Snapshot(tagIds);
+        var perms = await access.ForAsync(Context.User!, Context.ConnectionAborted);
+        var runtime = await access.RuntimeAsync(Context.ConnectionAborted);
+        var allowed = runtime.Allowed(perms, tagIds.Take(10_000));
+        rt.Subscribe(Context.ConnectionId, allowed);
+        return rt.Snapshot(allowed);
     }
 
     public override Task OnDisconnectedAsync(Exception? exception)
@@ -47,6 +51,7 @@ public sealed class RealtimeService : BackgroundService
     private readonly ILogger<RealtimeService> _log;
     private readonly ILoggerFactory _loggers;
     private readonly CommandWaiter _waiter;
+    private readonly AccessService _access;
     private readonly RealtimeOptions _opt;
     private readonly ConcurrentDictionary<int, TagValue> _values = new();
     private readonly ConcurrentDictionary<string, HashSet<int>> _subs = new();
@@ -60,12 +65,13 @@ public sealed class RealtimeService : BackgroundService
     public int CachedValues => _values.Count;
     public int Connections => _subs.Count;
 
-    public RealtimeService(NpgsqlDataSource ds, IHubContext<RealtimeHub> hub, CommandWaiter waiter,
+    public RealtimeService(NpgsqlDataSource ds, IHubContext<RealtimeHub> hub, CommandWaiter waiter, AccessService access,
         Microsoft.Extensions.Options.IOptions<RealtimeOptions> opt, ILogger<RealtimeService> log, ILoggerFactory loggers)
     {
         _ds = ds;
         _hub = hub;
         _waiter = waiter;
+        _access = access;
         _opt = opt.Value;
         _log = log;
         _loggers = loggers;
@@ -93,7 +99,7 @@ public sealed class RealtimeService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         _listener = new PgListener(_ds, _loggers.CreateLogger<PgListener>(),
-            [PgChannels.Values, PgChannels.Alarm, PgChannels.CommandDone, PgChannels.Device,
+            [PgChannels.Values, PgChannels.Alarm, PgChannels.CommandDone, PgChannels.CommandConfirm, PgChannels.Device,
              PgChannels.Heartbeat, PgChannels.Config, PgChannels.ConfigApplied, PgChannels.Draft],
             OnNotificationAsync, ResyncAsync);
         await Task.WhenAll(_listener.RunAsync(ct), FlushLoop(ct));
@@ -127,6 +133,7 @@ public sealed class RealtimeService : BackgroundService
             LastHeartbeatAt = hb.At;
             LastHeartbeat = hb.Json;
         }
+        _access.InvalidateRuntime();
         // клиентам — перечитать тревоги и диагностику
         await _hub.Clients.All.SendAsync("resync", ct);
     }
@@ -164,6 +171,12 @@ public sealed class RealtimeService : BackgroundService
                 }
                 break;
 
+            case PgChannels.CommandConfirm:
+                // окно подтверждения: клиенты с правом «Критичные команды» перечитывают список ожидающих
+                if (long.TryParse(n.Payload, NumberStyles.None, CultureInfo.InvariantCulture, out var cid))
+                    await _hub.Clients.All.SendAsync("confirmRequest", cid, ct);
+                break;
+
             case PgChannels.Device:
                 if (int.TryParse(n.Payload, NumberStyles.None, CultureInfo.InvariantCulture, out var devId))
                     await _hub.Clients.All.SendAsync("device", devId, ct);
@@ -181,6 +194,7 @@ public sealed class RealtimeService : BackgroundService
                 break;
 
             case PgChannels.Config:
+                _access.InvalidateRuntime();
                 // опубликована версия: экраны операторов перечитывают схемы
                 await _hub.Clients.All.SendAsync("published", n.Payload, ct);
                 break;
@@ -190,6 +204,10 @@ public sealed class RealtimeService : BackgroundService
                 break;
         }
     }
+
+    /// <summary>Системное оповещение всех АРМ (например, вход аварийной учётной записью).</summary>
+    public Task SystemNoticeAsync(string level, string text, CancellationToken ct) =>
+        _hub.Clients.All.SendAsync("systemNotice", new { level, text, ts = DateTime.UtcNow }, ct);
 
     private async Task FlushLoop(CancellationToken ct)
     {

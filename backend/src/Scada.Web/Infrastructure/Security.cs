@@ -7,30 +7,6 @@ using Scada.Core.Notify;
 
 namespace Scada.Web.Infrastructure;
 
-public static class Roles
-{
-    public const string Viewer = "viewer";
-    public const string Operator = "operator";
-    public const string Engineer = "engineer";
-    public const string Admin = "admin";
-
-    public static readonly string[] All = [Viewer, Operator, Engineer, Admin];
-
-    // политики по возрастанию прав
-    public const string CanView = "CanView";
-    public const string CanOperate = "CanOperate";
-    public const string CanEngineer = "CanEngineer";
-    public const string CanAdmin = "CanAdmin";
-
-    public static void AddPolicies(Microsoft.AspNetCore.Authorization.AuthorizationOptions o)
-    {
-        o.AddPolicy(CanView, p => p.RequireRole(Viewer, Operator, Engineer, Admin));
-        o.AddPolicy(CanOperate, p => p.RequireRole(Operator, Engineer, Admin));
-        o.AddPolicy(CanEngineer, p => p.RequireRole(Engineer, Admin));
-        o.AddPolicy(CanAdmin, p => p.RequireRole(Admin));
-    }
-}
-
 public static class UserExt
 {
     public static string Login(this ClaimsPrincipal u) => u.Identity?.Name ?? "?";

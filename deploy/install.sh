@@ -51,9 +51,10 @@ if [ "${SKIP_DB:-0}" != "1" ]; then
   # схема применяется от имени владельца (скрипт идемпотентен)
   "${PSQL[@]}" -d "$DB" -c "SET ROLE $OWNER" -f /opt/scada/db/001_schema.sql
   "${PSQL[@]}" -d "$DB" -c "SET ROLE $OWNER" -f /opt/scada/db/004_publication.sql
+  "${PSQL[@]}" -d "$DB" -c "SET ROLE $OWNER" -f /opt/scada/db/005_access.sql
   if [ "${SCADA_DEMO:-0}" = "1" ]; then
     EMPTY="$("${PSQL[@]}" -d "$DB" -tAc "SELECT count(*) = 0 FROM scada.devices")"
-    [ "$EMPTY" = "t" ] && "${PSQL[@]}" -d "$DB" -c "SET ROLE $OWNER" -f /opt/scada/db/002_demo.sql && echo "    загружены демо-данные"
+    [ "$EMPTY" = "t" ] && "${PSQL[@]}" -d "$DB" -c "SET ROLE $OWNER" -f /opt/scada/db/002_demo.sql  && "${PSQL[@]}" -d "$DB" -c "SET ROLE $OWNER" -f /opt/scada/db/006_demo_access.sql && echo "    загружены демо-данные"
   fi
   "${PSQL[@]}" -d "$DB" -f /opt/scada/db/003_app_role.sql
   if [ "${NEW_ENV:-0}" = "1" ]; then
