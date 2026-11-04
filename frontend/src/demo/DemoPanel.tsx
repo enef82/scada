@@ -1,10 +1,11 @@
 // Панель прототипа: задания для юзабилити-теста с автоматической проверкой и временем,
 // сценарии отказов, смена роли и скорости модели. В рабочей сборке не подключается.
 import { useEffect, useState } from 'react';
-import { roleNames } from '../lib/format';
-import { toast, useAuth } from '../lib/stores';
-import type { Role } from '../lib/types';
-import { marks, onMarks, procState, resetDemo, scenarios, setScenario, setSpeed, speed, switchRole, type Scenarios } from './sim';
+import { errorText } from '../lib/api';
+import { emit as emitRealtime } from '../lib/realtime';
+import { toast, useAreas, useAuth, useMeta } from '../lib/stores';
+import { personas, type Persona } from './data';
+import { awaitingCommands, confirmCommand, marks, onMarks, procState, resetDemo, scenarios, setScenario, setSpeed, speed, switchPersona, type Scenarios } from './sim';
 
 interface Task { id: string; text: string; hint: string; check?: () => boolean }
 
@@ -15,8 +16,10 @@ const TASKS: Task[] = [
   { id: 'manual', text: 'Переведите КНС-1 в ручной режим и запустите насос Н-2', hint: 'Проверяется автоматически', check: () => procState().auto === 0 && procState().p2 === 1 },
   { id: 'sp', text: 'Измените уставку уровня пуска на 2,5 м', hint: 'Проверяется автоматически', check: () => Math.abs(procState().sp - 2.5) < 0.001 },
   { id: 'trend', text: 'Постройте тренд уровня и давления КНС-1 за последний час', hint: 'Проверяется автоматически', check: () => marks.has('trend') },
-  { id: 'shelve', text: 'Снимите тревогу «Открыта дверь КНС» с контроля на 1 час, указав причину', hint: 'Проверяется автоматически', check: () => marks.has('shelveDoor') },
+  { id: 'shelve', text: 'Под ролью «Ст. оператор» снимите тревогу «Открыта дверь КНС» с контроля на 1 час, указав причину (у оператора этого права нет)', hint: 'Проверяется автоматически', check: () => marks.has('shelveDoor') },
   { id: 'lamp', text: 'Под ролью «Инженер» добавьте на схему КНС-1 лампу «Н-2 в работе» (тег KNS1_P2_Run), сохраните и опубликуйте — оператор должен её увидеть', hint: 'Засчитывается после публикации', check: () => marks.has('lamp') },
+  { id: 'critical', text: 'Под ролью «Ст. оператор» включите сценарий «Перегрев Н-1» и выполните деблокировку защиты Н-1 на схеме КНС-1. Подтвердите её вторым пользователем в блоке «Второе рабочее место»', hint: 'Критичная команда — пароль, причина и второй пользователь', check: () => marks.has('criticalDone') },
+  { id: 'assign', text: 'Под ролью «Адм. ИБ» выдайте наладчику pnr.kuznetsov роль «Оператор» на области КНС-2 со сроком действия', hint: 'Раздел «Доступ»', check: () => marks.has('assign') },
 ];
 
 interface TestState { startedAt: number | null; done: Record<string, number>; notes: string }
@@ -87,10 +90,14 @@ export default function DemoPanel() {
     catch { toast.error('Браузер не дал доступ к буферу обмена — выделите текст замечаний вручную'); }
   };
 
-  const role = (r: Role) => {
-    const m = switchRole(r);
+  const role = (r: Persona) => {
+    const m = switchPersona(r);
     useAuth.setState({ me: m, loaded: true });
-    toast.info(`Роль: ${roleNames[r]}`);
+    // права другие — перечитать списки (схемы, теги, тревоги) как после входа
+    void useMeta.getState().reloadAll().catch(() => {});
+    void useAreas.getState().reload().catch(() => {});
+    emitRealtime('resync');
+    toast.info(`${personas.find((p) => p.key === r)?.label}: ${m?.roles.join(', ')}`);
   };
 
   if (!open) {
@@ -110,13 +117,15 @@ export default function DemoPanel() {
       </div>
 
       <div className="demo-section">
-        <div className="demo-label">Роль</div>
-        <div className="demo-seg">
-          {(['viewer', 'operator', 'engineer', 'admin'] as Role[]).map((r) => (
-            <button key={r} className={me?.role === r ? 'active' : ''} onClick={() => role(r)}>{roleNames[r]}</button>
+        <div className="demo-label">Кто работает</div>
+        <div className="demo-seg demo-seg-3">
+          {personas.map((p) => (
+            <button key={p.key} title={`${p.login}: ${p.hint}`} className={me?.login === p.login ? 'active' : ''} onClick={() => role(p.key)}>{p.label}</button>
           ))}
         </div>
+        <div className="small muted">{personas.find((p) => p.login === me?.login)?.hint}</div>
       </div>
+      <SecondWorkstation />
 
       <div className="tabs demo-tabs">
         <button className={tab === 'tasks' ? 'active' : ''} onClick={() => setTab('tasks')}>Задания</button>
@@ -176,5 +185,35 @@ export default function DemoPanel() {
         </div>
       )}
     </aside>
+  );
+}
+
+/**
+ * «Второе рабочее место»: в прототипе один браузер, поэтому второго пользователя изображает панель.
+ * Критичную команду подтверждает Сидоров (Старший оператор), если её запросил кто-то другой, и наоборот.
+ */
+function SecondWorkstation() {
+  const [, force] = useState(0);
+  useEffect(() => { const t = setInterval(() => force((x) => x + 1), 1000); return () => clearInterval(t); }, []);
+  const list = awaitingCommands();
+  if (!list.length) return null;
+  return (
+    <div className="demo-section demo-second">
+      <div className="demo-label">Второе рабочее место</div>
+      {list.map((c) => {
+        // второй подтверждающий — другой старший оператор (у автора свой сеанс)
+        const login = c.requestedBy === 'sidorov' ? 'smirnova' : 'sidorov';
+        return (
+          <div key={c.id} className="small">
+            <b>{c.tagName}</b> ← {String(c.value)} {c.unit} · от {c.requestedBy} · {c.secondsLeft} с
+            {c.comment && <div className="muted">«{c.comment}»</div>}
+            <div className="row">
+              <button className="danger" onClick={() => { try { confirmCommand(c.id, login, true); toast.ok(`${login}: команда подтверждена`); } catch (e) { toast.error(errorText(e)); } }}>Подтвердить как {login}</button>
+              <button onClick={() => { try { confirmCommand(c.id, login, false, 'не согласовано'); } catch (e) { toast.error(errorText(e)); } }}>Отклонить</button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
   );
 }

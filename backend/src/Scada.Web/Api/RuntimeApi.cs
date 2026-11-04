@@ -266,6 +266,11 @@ public static class RuntimeApi
             return Results.Ok(new { id, status, result });
         }).RequireAuthorization(Policies.Of(Perm.CmdControl, Perm.CmdSetpoint, Perm.CmdCritical));
 
+        api.MapGet("/commands/settings", (IOptions<CommandOptions> opt) => new
+        {
+            ttlSeconds = opt.Value.TtlSeconds, confirmSeconds = opt.Value.ConfirmSeconds, criticalConfirmMode = opt.Value.CriticalConfirmMode,
+        }).RequireAuthorization();
+
         // запросы на второе подтверждение, которые может подтвердить текущий пользователь
         api.MapGet("/commands/awaiting", async (HttpContext http, NpgsqlDataSource ds, AccessService access, RealtimeService rt,
             CancellationToken ct) =>

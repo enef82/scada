@@ -345,3 +345,34 @@ button.danger-outline { color: var(--bad); border-color: #fca5a5; }
 .publish-form > .row, .publish-form > p, .publish-form > .accept { grid-column: 1 / -1; }
 .accept { gap: 8px; }
 @media (max-width: 760px) { .publish-form { grid-template-columns: 1fr; } }
+
+/* ---------------------------------------------------------------- доступ, классы команд */
+.confirm-requests { position: fixed; right: 16px; bottom: 56px; z-index: 60; display: flex; flex-direction: column; gap: 8px; max-width: min(460px, calc(100vw - 32px)); }
+body.demo-docked .confirm-requests { right: 356px; }
+.confirm-request { display: flex; align-items: center; gap: 12px; background: #fff; border: 2px solid #dc2626; border-radius: 8px;
+  padding: 10px 12px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.25); animation: confirm-pulse 1.6s ease-in-out infinite; }
+.confirm-request > div:first-child { flex: 1; min-width: 0; }
+@keyframes confirm-pulse { 50% { box-shadow: 0 10px 30px rgba(220, 38, 38, 0.45); } }
+.confirm-wait { display: flex; gap: 16px; align-items: center; }
+.confirm-timer { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; color: #1e40af; min-width: 64px; text-align: center; }
+.confirm-timer.small { font-size: 15px; min-width: 40px; }
+.confirm-timer.warn { color: #dc2626; }
+.cmd-secret { margin-top: 8px; }
+.card-block { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px; }
+.card-block h4 { margin: 0; }
+.tabs a { padding: 6px 12px; border: 1px solid var(--line); border-radius: 4px; color: inherit; text-decoration: none; background: var(--panel); }
+.tabs a.active { background: #1e293b; color: #fff; border-color: #1e293b; }
+.matrix-wrap { overflow-x: auto; }
+.matrix th { text-align: center; vertical-align: bottom; min-width: 110px; }
+.matrix th:first-child { text-align: left; min-width: 260px; }
+.matrix-cell { text-align: center; font-size: 16px; color: #15803d; font-weight: 700; }
+.matrix-cell .actions { justify-content: center; flex-wrap: wrap; }
+.perm-list { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; margin-top: 10px; }
+.perm-item { display: flex; gap: 8px; align-items: flex-start; padding: 6px; border-radius: 4px; }
+.perm-item:hover { background: #f1f5f9; }
+@media (max-width: 760px) { .perm-list { grid-template-columns: 1fr; } }
+.demo-second { border: 2px solid #dc2626; border-radius: 6px; margin: 0 12px 8px; background: #fef2f2; }
+.demo-seg-3 { grid-template-columns: repeat(3, 1fr); }
+.demo-panel { overflow-x: hidden; }
+.demo-seg button { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.matrix .actions button { font-size: 12px; padding: 2px 8px; }

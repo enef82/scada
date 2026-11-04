@@ -1,102 +1,24 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Badge, Empty, Field, Modal, askConfirm } from '../components/ui';
+import { Badge, Empty } from '../components/ui';
 import { api, errorText, qs } from '../lib/api';
-import { formatNumber, formatTime, roleNames, toLocalInput } from '../lib/format';
+import { formatNumber, formatTime, toLocalInput } from '../lib/format';
 import { useRtStatus } from '../lib/realtime';
-import { toast, useAuth, useCan, useMeta } from '../lib/stores';
-import type { AuditRow, Role, UserRow } from '../lib/types';
-
-// ------------------------------------------------------------------ пользователи
-export function UsersPage() {
-  const [rows, setRows] = useState<UserRow[]>([]);
-  const [edit, setEdit] = useState<Partial<UserRow> | null>(null);
-  const me = useAuth((s) => s.me);
-  const load = useCallback(async () => {
-    try { setRows(await api.get<UserRow[]>('/api/users')); } catch (e) { toast.error(errorText(e)); }
-  }, []);
-  useEffect(() => { void load(); }, [load]);
-
-  const remove = async (u: UserRow) => {
-    if (!(await askConfirm(`Удалить пользователя ${u.login}? Действует сразу.`, { ok: 'Удалить' }))) return;
-    try { await api.del(`/api/users/${u.id}`); void load(); } catch (e) { toast.error(errorText(e)); }
-  };
-
-  return (
-    <div className="page">
-      <div className="toolbar">
-        <h3>Пользователи</h3>
-        <span className="grow" />
-        <button className="primary" onClick={() => setEdit({ login: '', displayName: '', role: 'operator', enabled: true })}>Добавить</button>
-      </div>
-      <table className="table">
-        <thead><tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Активен</th><th>Последний вход</th><th /></tr></thead>
-        <tbody>
-          {rows.map((u) => (
-            <tr key={u.id} className={u.enabled ? '' : 'row-disabled'}>
-              <td><b>{u.login}</b>{u.mustChangePassword && <Badge kind="warn">смена пароля</Badge>}</td>
-              <td>{u.displayName}</td>
-              <td>{roleNames[u.role]}</td>
-              <td>{u.enabled ? 'да' : 'нет'}</td>
-              <td>{formatTime(u.lastLoginAt)}</td>
-              <td className="actions">
-                <button onClick={() => setEdit(u)}>Изменить</button>
-                <button disabled={u.login === me?.login} onClick={() => void remove(u)}>×</button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {edit && <UserForm u={edit} onClose={() => setEdit(null)} onSaved={() => { setEdit(null); void load(); }} />}
-    </div>
-  );
-}
-
-function UserForm({ u, onClose, onSaved }: { u: Partial<UserRow>; onClose: () => void; onSaved: () => void }) {
-  const [login, setLogin] = useState(u.login ?? '');
-  const [displayName, setName] = useState(u.displayName ?? '');
-  const [role, setRole] = useState<Role>(u.role ?? 'operator');
-  const [enabled, setEnabled] = useState(u.enabled ?? true);
-  const [password, setPassword] = useState('');
-  const save = async () => {
-    try {
-      const body = { login, displayName, role, enabled, password: password || null };
-      if (u.id) await api.put(`/api/users/${u.id}`, body); else await api.post('/api/users', body);
-      toast.ok('Сохранено');
-      onSaved();
-    } catch (e) { toast.error(errorText(e)); }
-  };
-  return (
-    <Modal title={u.id ? `Пользователь ${u.login}` : 'Новый пользователь'} onClose={onClose}
-      footer={<><button onClick={onClose}>Отмена</button><button className="primary" onClick={save}>Сохранить</button></>}>
-      <div className="form">
-        <Field label="Логин"><input value={login} disabled={!!u.id} onChange={(e) => setLogin(e.target.value)} /></Field>
-        <Field label="Имя (ФИО)"><input value={displayName} onChange={(e) => setName(e.target.value)} /></Field>
-        <Field label="Роль">
-          <select value={role} onChange={(e) => setRole(e.target.value as Role)}>
-            {Object.entries(roleNames).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-          </select>
-        </Field>
-        <Field label="Активен"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /></Field>
-        <Field label={u.id ? 'Новый пароль (сброс)' : 'Пароль'} hint="не короче 8 символов; при первом входе потребуется смена" wide>
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-        </Field>
-      </div>
-      <p className="muted small">
-        Наблюдатель — только просмотр. Оператор — команды и квитирование. Инженер — конфигурация и схемы. Администратор — пользователи.
-      </p>
-    </Modal>
-  );
-}
+import { toast, useCan, useMeta } from '../lib/stores';
+import type { AuditRow } from '../lib/types';
 
 // ------------------------------------------------------------------ аудит
 const actionNames: Record<string, string> = {
   login: 'Вход', login_failed: 'Неудачный вход', logout: 'Выход', password_change: 'Смена пароля',
   config_change: 'Изменение конфигурации', command: 'Команда', alarm_ack: 'Квитирование', alarm_shelve: 'Снятие с контроля',
   alarm_unshelve: 'Возврат на контроль', import: 'Импорт', export: 'Экспорт', user_change: 'Пользователи',
+  config_publish: 'Публикация', config_rollback: 'Откат', draft_discard: 'Сброс черновика', publish_denied: 'Публикация отклонена',
+  role_change: 'Роли', assignment_change: 'Назначения', area_change: 'Области', access_denied: 'Отказ в доступе',
+  command_requested: 'Запрос критичной команды', command_confirm: 'Второе подтверждение', command_denied: 'Команда отклонена',
+  emergency_login: 'Вход аварийной записью', session_revoked: 'Сеанс прекращён',
 };
 
 export function AuditPage() {
-  const isAdmin = useCan('admin');
+  const isAdmin = useCan('audit.view');
   const [from, setFrom] = useState(() => toLocalInput(new Date(Date.now() - 7 * 86400_000)));
   const [to, setTo] = useState(() => toLocalInput(new Date(Date.now() + 60_000)));
   const [action, setAction] = useState('');
@@ -134,7 +56,7 @@ export function AuditPage() {
           <thead><tr><th>№</th><th>Время</th><th>Пользователь</th><th>Действие</th><th>Объект</th><th>Подробности</th><th>IP</th></tr></thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={r.id} className={r.action === 'login_failed' ? 'row-warn' : ''}>
+              <tr key={r.id} className={['login_failed', 'access_denied', 'emergency_login', 'publish_denied', 'session_revoked'].includes(r.action) ? 'row-warn' : ''}>
                 <td>{r.id}</td>
                 <td>{formatTime(r.ts)}</td>
                 <td>{r.user}</td>

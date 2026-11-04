@@ -1,15 +1,23 @@
 import { useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Empty, Field, Modal, NumberInput, QualityDot, askConfirm } from '../components/ui';
+import { AreaSelect, Empty, Field, Modal, NumberInput, QualityDot, askConfirm } from '../components/ui';
 import { requestCommand } from '../components/CommandDialog';
 import { api, ApiError, errorText } from '../lib/api';
 import { formatTime, formatValue, qualityName } from '../lib/format';
 import { useTagSubscription, useTagValue } from '../lib/realtime';
-import { toast, useCan, useMeta } from '../lib/stores';
-import type { ArchiveMode, DataType, Tag } from '../lib/types';
+import { areaPath, commandPerm, toast, useAreas, useCan, useMeta, usePerms } from '../lib/stores';
+import type { ArchiveMode, CommandClass, DataType, Tag } from '../lib/types';
+
+export const CLASS_NAMES: Record<CommandClass, string> = { normal: 'Обычный', important: 'Важный', critical: 'Критичный' };
 
 const TYPES: DataType[] = ['bool', 'int16', 'uint16', 'int32', 'uint32', 'float32', 'float64', 'string'];
 const PAGE = 200;
+
+const CLASS_HINT: Record<CommandClass, string> = {
+  normal: 'диалог с текущим и новым значением',
+  important: 'диалог + повторный ввод пароля и комментарий',
+  critical: 'пароль, комментарий и второй пользователь с правом «Критичные команды» за 60 с',
+};
 
 const ADDRESS_HINT: Record<string, string> = {
   simulator: 'sine:period=60,amp=10,offset=50 · ramp:period=30,min=0,max=100 · random:min=0,max=1 · square:period=10 · memory:имя=0 · follow:имя,tau=5',
@@ -21,7 +29,9 @@ export function TagsPage() {
   const tags = useMeta((s) => s.tags);
   const devices = useMeta((s) => s.devices);
   const reload = useMeta((s) => s.reloadTags);
-  const can = useCan('engineer');
+  const can = useCan('config.edit');
+  const perms = usePerms();
+  useAreas((s) => s.byId);
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const [deviceId, setDeviceId] = useState<number | ''>('');
@@ -59,7 +69,7 @@ export function TagsPage() {
     name: '', description: '', deviceId: devices[0]?.id, address: '', dataType: 'float32', unit: '',
     rawLow: null, rawHigh: null, engLow: null, engHigh: null, pollMs: null, staleAfterMs: null,
     deadbandUi: 0, deadbandArchive: 0, archiveMode: 'change', archiveIntervalS: 60,
-    writable: false, writeMin: null, writeMax: null, writeConfirm: true, enabled: true,
+    writable: false, writeMin: null, writeMax: null, writeConfirm: true, enabled: true, areaId: null, commandClass: 'normal',
   });
 
   return (
@@ -80,10 +90,10 @@ export function TagsPage() {
       </div>
       {filtered.length === 0 ? <Empty>Тегов нет</Empty> : (
         <table className="table">
-          <thead><tr><th /><th>Имя</th><th>Описание</th><th>Устройство</th><th>Адрес</th><th>Тип</th><th>Значение</th><th>Время</th><th>Архив</th><th /></tr></thead>
+          <thead><tr><th /><th>Имя</th><th>Описание</th><th>Устройство</th><th>Адрес</th><th>Тип</th><th>Область</th><th>Значение</th><th>Время</th><th>Архив</th><th /></tr></thead>
           <tbody>
             {visible.map((t) => (
-              <TagRow key={t.id} tag={t} device={devices.find((d) => d.id === t.deviceId)?.name ?? '?'} can={can}
+              <TagRow key={t.id} tag={t} device={devices.find((d) => d.id === t.deviceId)?.name ?? '?'} can={perms('config.edit', t.effectiveAreaId)}
                 onEdit={() => setEdit(t)} onDelete={() => void remove(t)} onTrend={() => navigate(`/trends?tags=${t.id}`)} />
             ))}
           </tbody>
@@ -110,7 +120,7 @@ export function TagsPage() {
 function TagRow(props: { tag: Tag; device: string; can: boolean; onEdit: () => void; onDelete: () => void; onTrend: () => void }) {
   const { tag: t } = props;
   const v = useTagValue(t.id);
-  const canWrite = useCan('operator') && t.writable;
+  const canWrite = useCan(commandPerm(t), t.effectiveAreaId) && t.writable;
   return (
     <tr className={t.enabled ? '' : 'row-disabled'}>
       <td><QualityDot q={v?.[3]} /></td>
@@ -118,7 +128,8 @@ function TagRow(props: { tag: Tag; device: string; can: boolean; onEdit: () => v
       <td>{t.description}</td>
       <td>{props.device}</td>
       <td className="mono">{t.address}</td>
-      <td>{t.dataType}{t.writable ? ' ✎' : ''}</td>
+      <td>{t.dataType}{t.writable ? <span title={`запись, класс «${CLASS_NAMES[t.commandClass]}»`}> ✎{t.commandClass !== 'normal' ? (t.commandClass === 'critical' ? '‼' : '!') : ''}</span> : ''}</td>
+      <td className="small muted">{areaPath(t.effectiveAreaId)}</td>
       <td className="mono" title={qualityName(v?.[3])}>{formatValue(t, v?.[1], v?.[2])} {t.unit}</td>
       <td className="small">{v ? formatTime(v[4], false) : ''}</td>
       <td className="small">{t.archiveMode === 'none' ? '—' : t.archiveMode === 'change' ? 'по изм.' : `${t.archiveIntervalS} с`}</td>
@@ -193,7 +204,19 @@ function TagForm({ tag, onClose, onSaved }: { tag: Partial<Tag>; onClose: () => 
         <div className="form-section">Запись из SCADA</div>
         <Field label="Разрешить запись"><input type="checkbox" checked={!!t.writable} onChange={(e) => set('writable', e.target.checked)} /></Field>
         {nf('writeMin', 'Мин. значение')}{nf('writeMax', 'Макс. значение')}
-        <Field label="Подтверждение оператора"><input type="checkbox" checked={!!t.writeConfirm} onChange={(e) => set('writeConfirm', e.target.checked)} /></Field>
+        <Field label="Подтверждение оператора" hint="для класса «Обычный»; важные и критичные подтверждаются всегда">
+          <input type="checkbox" checked={!!t.writeConfirm || t.commandClass !== 'normal'} disabled={t.commandClass !== 'normal'} onChange={(e) => set('writeConfirm', e.target.checked)} />
+        </Field>
+        <Field label="Класс критичности" hint={CLASS_HINT[t.commandClass ?? 'normal']} wide>
+          <select value={t.commandClass ?? 'normal'} disabled={!t.writable} onChange={(e) => set('commandClass', e.target.value as CommandClass)}>
+            {(Object.keys(CLASS_NAMES) as CommandClass[]).map((c) => <option key={c} value={c}>{CLASS_NAMES[c]}</option>)}
+          </select>
+        </Field>
+
+        <div className="form-section">Доступ</div>
+        <Field label="Область" hint="пусто — область устройства" wide>
+          <AreaSelect value={t.areaId} perm="config.edit" inherit="как у устройства" onChange={(v) => set('areaId', v)} />
+        </Field>
       </div>
     </Modal>
   );

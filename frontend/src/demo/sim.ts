@@ -1,36 +1,41 @@
 // Симулятор КНС и «сервер» в браузере для демо-режима.
 // Модель процесса: приток в резервуар, два насоса, задвижка, режим «Автомат» как в ПЛК.
 // Тревоги, команды, архив, аудит, конфигурация — в памяти; конфигурация и схемы сохраняются в localStorage.
-import type { ActiveAlarm, AlarmDef, AlarmEvent, AuditRow, ChangeItem, ChangeSummary, CommandRow, Device, FieldChange, ObjectType, Role, Tag, TagValueTuple, ValidationIssue } from '../lib/types';
+import type { ActiveAlarm, AlarmDef, AlarmEvent, Area, AuditRow, ChangeItem, ChangeSummary, CommandRow, Device, FieldChange, ObjectType, Perm, Tag, TagValueTuple, ValidationIssue } from '../lib/types';
+import { PERMS } from '../lib/types';
 import type { DemoTransport, EventName } from '../lib/realtime';
 import { boundTagNames, type MnemoDoc } from '../mnemo/model';
-import { alarmDefsSeed, devicesSeed, mnemosSeed, roleUser, tagsSeed, usersSeed, type DemoUser } from './data';
+import { alarmDefsSeed, areasSeed, assignmentsSeed, devicesSeed, mnemosSeed, personas, rolesSeed, tagsSeed, usersSeed, type DemoAssignment, type DemoRole, type DemoUser, type Persona } from './data';
 
 // ------------------------------------------------------------------ хранилище конфигурации
 // Черновик — рабочие списки cfg.devices/tags/alarmDefs/mnemos (их правит инженер).
 // Опубликованная конфигурация — неизменяемые снимки cfg.versions; служба сбора и операторы работают по последнему (rt).
-interface MnemoRec { id: number; name: string; parentId: number | null; sortOrder: number; versions: { version: number; doc: MnemoDoc; createdAt: string; createdBy: string }[]; updatedAt: string; updatedBy: string; deleted?: boolean }
-interface MnemoRef { id: number; name: string; parentId: number | null; sortOrder: number; version: number }
+interface MnemoRec { id: number; name: string; parentId: number | null; sortOrder: number; areaId: number; versions: { version: number; doc: MnemoDoc; createdAt: string; createdBy: string }[]; updatedAt: string; updatedBy: string; deleted?: boolean }
+interface MnemoRef { id: number; name: string; parentId: number | null; sortOrder: number; version: number; areaId: number }
 interface Snapshot { devices: Device[]; tags: Tag[]; alarmDefs: AlarmDef[]; mnemos: MnemoRef[] }
 interface VersionRec { version: number; createdAt: string; createdBy: string; comment: string; snapshot: Snapshot; changes: ChangeItem[]; warnings: number; rollbackOf: number | null; appliedAt: string | null; appliedMs: number | null }
 interface DraftLogRec { ts: string; user: string; type: ObjectType; id: number; name: string; op: 'create' | 'update' | 'delete' }
-interface Config { v: number; devices: Device[]; tags: Tag[]; alarmDefs: AlarmDef[]; mnemos: MnemoRec[]; users: DemoUser[]; seq: number; versions: VersionRec[]; draftLog: DraftLogRec[] }
+interface Config { v: number; devices: Device[]; tags: Tag[]; alarmDefs: AlarmDef[]; mnemos: MnemoRec[]; users: DemoUser[]; seq: number; versions: VersionRec[]; draftLog: DraftLogRec[];
+  areas: Area[]; roles: DemoRole[]; assignments: DemoAssignment[] }
 
-const STORE_KEY = 'scada-demo-config-v4';
+const STORE_KEY = 'scada-demo-config-v5';
 
 function seedConfig(): Config {
   const at = new Date().toISOString();
   const c: Config = {
-    v: 4,
+    v: 5,
     devices: structuredClone(devicesSeed),
     tags: structuredClone(tagsSeed),
     alarmDefs: structuredClone(alarmDefsSeed),
-    mnemos: mnemosSeed().map((m) => ({ id: m.id, name: m.name, parentId: m.parentId, sortOrder: m.sortOrder, updatedAt: at, updatedBy: 'petrova',
+    mnemos: mnemosSeed().map((m) => ({ id: m.id, name: m.name, parentId: m.parentId, sortOrder: m.sortOrder, areaId: m.areaId, updatedAt: at, updatedBy: 'petrova',
       versions: [{ version: 1, doc: m.doc, createdAt: at, createdBy: 'petrova' }] })),
     users: structuredClone(usersSeed),
     seq: 100,
     versions: [],
     draftLog: [],
+    areas: structuredClone(areasSeed),
+    roles: structuredClone(rolesSeed),
+    assignments: structuredClone(assignmentsSeed),
   };
   c.versions.push({ version: 1, createdAt: new Date(Date.now() - 6 * 86400_000).toISOString(), createdBy: 'petrova', comment: 'Исходная конфигурация',
     snapshot: draftSnapshot(c), changes: [], warnings: 0, rollbackOf: null, appliedAt: new Date(Date.now() - 6 * 86400_000 + 900).toISOString(), appliedMs: 900 });
@@ -42,7 +47,7 @@ function loadConfig(): Config {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) {
       const c = JSON.parse(raw) as Config;
-      if (c.v === 4) return c;
+      if (c.v === 5) return c;
     }
   } catch { /* хранилище недоступно */ }
   return seedConfig();
@@ -121,6 +126,7 @@ function modelValue(name: string): number | undefined {
     case 'KNS1_Valve1_Cmd': return Number(mem.v1);
     case 'KNS1_Door': return scenarios.door ? 1 : 0;
     case 'KNS1_Auto': return Number(mem.auto);
+    case 'KNS1_P1_Unblock': return 0;
     case 'KNS2_Level': return p.kns2 + noise(0.01);
     case 'KNS2_P1_Run': return p.kns2 > 2.5 ? 1 : 0;
     default: return undefined;
@@ -307,21 +313,90 @@ function addAudit(action: string, object: string, details: unknown = {}) {
   audit.unshift({ id: auditSeq++, ts: new Date().toISOString(), user: me()?.login ?? null, action, object, details, ip: '10.0.5.17' });
 }
 
-// ------------------------------------------------------------------ пользователь
-let currentLogin: string | null = roleUser.operator;
+// ------------------------------------------------------------------ пользователь и права (как Scada.Core.Access)
+let currentLogin: string | null = 'ivanov';
 const me = () => cfg.users.find((u) => u.login === currentLogin && u.enabled) ?? null;
-const rank: Record<Role, number> = { viewer: 0, operator: 1, engineer: 2, admin: 3 };
-const can = (r: Role) => { const u = me(); return !!u && rank[u.role] >= rank[r]; };
+const PERM_NAME = Object.fromEntries(PERMS.map((p) => [p.code, p.name])) as Record<Perm, string>;
+const ROOT_ONLY = new Set(PERMS.filter((p) => p.rootOnly).map((p) => p.code));
+const ROOT = 1;
 
-export function switchRole(role: Role) {
-  currentLogin = roleUser[role];
-  addAudit('login', `user:${currentLogin}`, { demo: 'смена роли' });
+function subtree(id: number): number[] {
+  const out: number[] = [];
+  const stack = [id];
+  const seen = new Set<number>();
+  while (stack.length) {
+    const x = stack.pop()!;
+    if (seen.has(x) || !cfg.areas.some((a) => a.id === x)) continue;
+    seen.add(x); out.push(x);
+    for (const c of cfg.areas) if (c.parentId === x) stack.push(c.id);
+  }
+  return out;
+}
+export function areaPathOf(id: number): string {
+  const parts: string[] = [];
+  const seen = new Set<number>();
+  for (let a = cfg.areas.find((x) => x.id === id); a && !seen.has(a.id); a = cfg.areas.find((x) => x.id === a!.parentId)) { seen.add(a.id); parts.unshift(a.name); }
+  return parts.join(' / ') || `#${id}`;
+}
+const within = (id: number, ancestor: number) => subtree(ancestor).includes(id);
+
+function permsFor(login: string | null): Map<Perm, Set<number>> {
+  const m = new Map<Perm, Set<number>>();
+  const now = Date.now();
+  for (const a of cfg.assignments) {
+    if (a.principalType !== 'user' || a.principal.toLowerCase() !== (login ?? '').toLowerCase()) continue;
+    if (a.validUntil && Date.parse(a.validUntil) <= now) continue;
+    const role = cfg.roles.find((r) => r.id === a.roleId);
+    if (!role) continue;
+    const areas = subtree(a.areaId);
+    for (const p of role.permissions) {
+      if (ROOT_ONLY.has(p) && a.areaId !== ROOT) continue;
+      const set = m.get(p) ?? new Set<number>();
+      areas.forEach((x) => set.add(x));
+      m.set(p, set);
+    }
+  }
+  return m;
+}
+const has = (perm: Perm, area?: number | null, login = currentLogin) => {
+  const set = permsFor(login).get(perm);
+  if (!set) return false;
+  return area === undefined || area === null ? set.size > 0 : set.has(area || ROOT);
+};
+/** Области с правом; null — везде. */
+const areasOf = (perm: Perm) => (has(perm, ROOT) ? null : [...(permsFor(currentLogin).get(perm) ?? [])]);
+const visible = (perm: Perm, area: number) => { const a = areasOf(perm); return a === null || a.includes(area); };
+
+function denyUnless(perm: Perm, area: number, what: string) {
+  if (has(perm, area)) return;
+  addAudit('access_denied', what, { perm, area: areaPathOf(area) });
+  bad(`Нет права «${PERM_NAME[perm]}» на область «${areaPathOf(area)}»`, 403);
+}
+
+function rolesOf(login: string): string[] {
+  const now = Date.now();
+  return [...new Set(cfg.assignments.filter((a) => a.principalType === 'user' && a.principal === login && !(a.validUntil && Date.parse(a.validUntil) <= now))
+    .map((a) => cfg.roles.find((r) => r.id === a.roleId)?.name ?? '?'))];
+}
+
+/** Демо: у каждой персоны свой «сеанс» — второй подтверждающий должен быть с другого. */
+const sessionOf = (login: string | null) => `demo-${login}`;
+
+export function switchPersona(key: Persona) {
+  currentLogin = personas.find((p) => p.key === key)!.login;
+  addAudit('login', `user:${currentLogin}`, { demo: 'смена персоны' });
   return meDto();
 }
 export const meDto = () => {
   const u = me();
-  return u ? { login: u.login, displayName: u.displayName, role: u.role, mustChangePassword: false } : null;
+  if (!u) return null;
+  const perms = permsFor(u.login);
+  const permissions: Record<string, number[] | 'all'> = {};
+  for (const [p, set] of perms) if (set.size) permissions[p] = set.has(ROOT) ? 'all' : [...set].sort((a, b) => a - b);
+  return { login: u.login, displayName: u.displayName, source: u.source, emergency: u.emergency, mustChangePassword: false,
+    permissions, roles: rolesOf(u.login), groups: [] as string[] };
 };
+export const currentUser = () => currentLogin;
 
 // ------------------------------------------------------------------ события для заданий оценки
 export const marks = new Set<string>();
@@ -347,6 +422,7 @@ function tick() {
   handlers?.values(vals);
   if (now - lastRecord >= 1000) { record(now); lastRecord = now; }
   if (evaluateAlarms(now)) fire('alarm', {});
+  if (awaiting.size) expireAwaiting();
   for (const d of rt.devices) {
     const s = !d.enabled ? 'disabled' : deviceOnline(d.id) ? 'online' : 'error';
     if (s === 'error') devErrors.set(d.id, (devErrors.get(d.id) ?? 0) + (tickNo % 2 ? 0 : 1));
@@ -398,7 +474,7 @@ export function resetDemo() {
 function draftSnapshot(c: Config = cfg): Snapshot {
   return structuredClone({
     devices: c.devices, tags: c.tags, alarmDefs: c.alarmDefs,
-    mnemos: c.mnemos.filter((m) => !m.deleted).map((m) => ({ id: m.id, name: m.name, parentId: m.parentId, sortOrder: m.sortOrder, version: m.versions.at(-1)?.version ?? 0 })),
+    mnemos: c.mnemos.filter((m) => !m.deleted).map((m) => ({ id: m.id, name: m.name, parentId: m.parentId, sortOrder: m.sortOrder, version: m.versions.at(-1)?.version ?? 0, areaId: m.areaId })),
   });
 }
 
@@ -406,9 +482,9 @@ function mnemoDoc(id: number, version: number): MnemoDoc | null {
   return cfg.mnemos.find((m) => m.id === id)?.versions.find((v) => v.version === version)?.doc ?? null;
 }
 
-const IGNORED = new Set(['id', 'rowVersion', 'state', 'lastOkAt', 'lastError', 'errorCount', 'avgLatencyMs']);
+const IGNORED = new Set(['id', 'rowVersion', 'state', 'lastOkAt', 'lastError', 'errorCount', 'avgLatencyMs', 'effectiveAreaId']);
 // изменения, которые влияют на безопасность и управление, — подсвечиваются в списке
-const SENSITIVE = new Set(['address', 'deviceId', 'writable', 'writeMin', 'writeMax', 'writeConfirm', 'limitValue', 'hysteresis', 'enabled', 'priority', 'endpoint', 'protocol']);
+const SENSITIVE = new Set(['address', 'deviceId', 'writable', 'writeMin', 'writeMax', 'writeConfirm', 'limitValue', 'hysteresis', 'enabled', 'priority', 'endpoint', 'protocol', 'areaId', 'commandClass']);
 const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 function diff(prev: Snapshot, next: Snapshot): ChangeItem[] {
@@ -447,6 +523,8 @@ function summarize(changes: ChangeItem[]): ChangeSummary {
 }
 
 /** Подмножество проверок ConfigValidator сервера: ошибки блокируют публикацию, предупреждения требуют подтверждения. */
+const CLASS_RU = { normal: 'Обычный', important: 'Важный', critical: 'Критичный' } as const;
+
 function validate(s: Snapshot, prev: Snapshot): { errors: ValidationIssue[]; warnings: ValidationIssue[] } {
   const all: ValidationIssue[] = [];
   const add = (code: string, level: 'error' | 'warning', message: string, objectType: ObjectType, objectId: number) =>
@@ -467,6 +545,10 @@ function validate(s: Snapshot, prev: Snapshot): { errors: ValidationIssue[]; war
       add('write-no-range', 'warning', `Тег ${t.name} доступен для записи без ограничения диапазона`, 'tag', t.id);
     if (t.writable && was && !was.writable) add('became-writable', 'warning', `Тег ${t.name} стал доступен для записи — операторы смогут отправлять на него команды`, 'tag', t.id);
     if (was?.writeConfirm && !t.writeConfirm) add('confirm-removed', 'warning', `Тег ${t.name}: снято обязательное подтверждение команды`, 'tag', t.id);
+    const rank = { normal: 0, important: 1, critical: 2 } as const;
+    if (t.writable && was?.writable && rank[t.commandClass ?? 'normal'] < rank[was.commandClass ?? 'normal'])
+      add('class-lowered', 'warning', `Тег ${t.name}: класс команды понижен «${CLASS_RU[was.commandClass]}» → «${CLASS_RU[t.commandClass]}» — подтверждение станет проще`, 'tag', t.id);
+    if (t.areaId !== null && !cfg.areas.some((a) => a.id === t.areaId)) add('area-missing', 'error', `Тег ${t.name}: область #${t.areaId} не существует`, 'tag', t.id);
     const key = `${t.deviceId}|${t.address}`;
     byAddr.set(key, [...(byAddr.get(key) ?? []), t]);
   }
@@ -558,15 +640,24 @@ function checkPassword(password: unknown, action: string) {
 // ------------------------------------------------------------------ HTTP API (подменяет fetch)
 class HttpError extends Error { constructor(public status: number, msg: string, public extra?: object) { super(msg); } }
 function bad(msg: string, status = 400, extra?: object): never { throw new HttpError(status, msg, extra); }
-const need = (r: Role) => { if (!me()) bad('Не выполнен вход', 401); if (!can(r)) bad('Недостаточно прав', 403); };
+/** Право хотя бы в одной области (любое из перечисленных). */
+const need = (...perms: Perm[]) => { if (!me()) bad('Не выполнен вход', 401); if (!perms.some((p) => has(p))) bad('Недостаточно прав', 403); };
+
+const snapTagArea = (s: { tags: Tag[]; devices: Device[] }, t: Tag) => t.areaId ?? s.devices.find((d) => d.id === t.deviceId)?.areaId ?? ROOT;
+const draftTagArea = (t: Tag) => snapTagArea(cfg, t);
+const draftTagAreaById = (id: number) => { const t = cfg.tags.find((x) => x.id === id); return t ? draftTagArea(t) : ROOT; };
+const rtTagArea = (id: number) => { const t = rt.tags.find((x) => x.id === id); return t ? snapTagArea(rt, t) : 0; };
+const rtAlarmArea = (id: number) => { const a = rt.alarmDefs.find((x) => x.id === id); return a ? rtTagArea(a.tagId) : 0; };
+const tagDto = (t: Tag) => ({ ...t, effectiveAreaId: draftTagArea(t) });
+const strip = <T extends object>(b: T) => { const x = { ...b } as Record<string, unknown>; delete x.effectiveAreaId; delete x.state; delete x.lastOkAt; delete x.lastError; delete x.errorCount; delete x.avgLatencyMs; return x as T; };
 
 function mnemoDto(m: MnemoRec) {
   return { id: m.id, name: m.name, parentId: m.parentId, sortOrder: m.sortOrder, currentVersion: m.versions.at(-1)?.version ?? 0, updatedAt: m.updatedAt, updatedBy: m.updatedBy,
-    publishedVersion: rt.mnemos.find((x) => x.id === m.id)?.version ?? null };
+    publishedVersion: rt.mnemos.find((x) => x.id === m.id)?.version ?? null, areaId: m.areaId };
 }
 
 function devicesDto() {
-  return cfg.devices.map((d) => {
+  return cfg.devices.filter((d) => visible('view', d.areaId)).map((d) => {
     const live = rt.devices.some((x) => x.id === d.id); // ещё не опубликовано — служба сбора его не опрашивает
     const s = devState.get(d.id) ?? (deviceOnline(d.id) ? 'online' : 'error');
     return { ...d, state: !live ? null : d.enabled ? s : 'disabled', lastOkAt: s === 'online' ? new Date().toISOString() : d.id === 2 ? new Date(Date.now() - (3 * 3600 + 17 * 60) * 1000).toISOString() : null,
@@ -597,26 +688,54 @@ function historyQuery(ids: number[], from: number, to: number, points: number) {
   return { mode: bucket <= 2 ? 'raw' : 'aggregate', bucketSeconds: bucket <= 2 ? 0 : bucket, series };
 }
 
-async function executeCommand(body: { tagId: number; value?: number; valueStr?: string; confirmed?: boolean }) {
-  need('operator');
+// ------------------------------------------------------------------ команды по классам критичности
+const CMD_TTL = 15, CONFIRM_S = 60;
+interface Awaiting { row: CommandRow; tag: Tag; value: number | string; session: string; expires: number }
+const awaiting = new Map<number, Awaiting>();
+
+async function executeCommand(body: { tagId: number; value?: number; valueStr?: string; confirmed?: boolean; password?: string; comment?: string }) {
+  if (!me()) bad('Не выполнен вход', 401);
+  // свойства тега — из опубликованной версии, по которой работает служба сбора
   const tag = rt.tags.find((t) => t.id === body.tagId) ?? bad('Тег не найден', 404);
+  const area = rtTagArea(tag.id);
+  const cls = tag.commandClass ?? 'normal';
+  const perm: Perm = cls === 'critical' ? 'cmd.critical' : tag.dataType === 'bool' ? 'cmd.control' : 'cmd.setpoint';
   if (!tag.enabled || !tag.writable) bad('Тег недоступен для записи', 403);
-  if (tag.writeConfirm && !body.confirmed) bad('Требуется подтверждение оператора', 428);
+  denyUnless(perm, area, `tag:${tag.id}`);
+  if ((cls !== 'normal' || tag.writeConfirm) && !body.confirmed) bad('Требуется подтверждение оператора', 428);
+  if (cls !== 'normal') {
+    if (!String(body.comment ?? '').trim()) bad('Для этой команды обязателен комментарий');
+    if (!String(body.password ?? '')) { addAudit('command_denied', `tag:${tag.id}`, { reason: 'password' }); bad('Неверный пароль', 403); }
+  }
   const value = tag.dataType === 'string' ? body.valueStr : body.value;
   if (value === undefined || value === null) bad('Не задано значение');
   if (typeof value === 'number' && ((tag.writeMin !== null && value < tag.writeMin) || (tag.writeMax !== null && value > tag.writeMax)))
     bad(`Значение вне диапазона [${tag.writeMin ?? '−∞'}; ${tag.writeMax ?? '+∞'}]`);
 
+  const critical = cls === 'critical';
   const row: CommandRow = { id: cmdSeq++, tagId: tag.id, tagName: tag.name, valueNum: typeof value === 'number' ? value : null,
     valueStr: typeof value === 'string' ? value : null, requestedBy: me()!.login, requestedAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + 15000).toISOString(), status: 'executing', result: null, readbackNum: null, finishedAt: null };
+    expiresAt: new Date(Date.now() + (critical ? CONFIRM_S : CMD_TTL) * 1000).toISOString(), status: critical ? 'awaiting_confirm' : 'executing',
+    result: null, readbackNum: null, finishedAt: null, commandClass: cls, comment: body.comment?.trim() || null, confirmedBy: null };
   commands.unshift(row);
+  if (critical) {
+    awaiting.set(row.id, { row, tag, value, session: sessionOf(currentLogin), expires: Date.now() + CONFIRM_S * 1000 });
+    addAudit('command_requested', `tag:${tag.id}`, { command: row.id, tag: tag.name, value, commandClass: cls, comment: row.comment });
+    fire('confirmRequest', row.id);
+    mark('criticalRequested');
+    return { id: row.id, status: 'awaiting_confirm', confirmSeconds: CONFIRM_S };
+  }
+  return runCommand(row, tag, value, { confirmation: cls === 'important' ? 'password+comment' : tag.writeConfirm ? 'dialog' : 'none' });
+}
+
+async function runCommand(row: CommandRow, tag: Tag, value: number | string, details: object) {
+  row.status = 'executing';
   fire('command', { id: row.id, status: row.status });
   await new Promise((r) => setTimeout(r, 350 + Math.random() * 300));
 
   const finish = (status: CommandRow['status'], result: string) => {
     Object.assign(row, { status, result, finishedAt: new Date().toISOString() });
-    addAudit('command', `tag:${tag.id}`, { command: row.id, tag: tag.name, value, status, result });
+    addAudit('command', `tag:${tag.id}`, { command: row.id, tag: tag.name, value, status, result, commandClass: row.commandClass, comment: row.comment, confirmedBy: row.confirmedBy, ...details });
     fire('command', { id: row.id, status, result });
     return { id: row.id, status, result };
   };
@@ -625,6 +744,14 @@ async function executeCommand(body: { tagId: number; value?: number; valueStr?: 
   const pumpCmd = tag.name === 'KNS1_P1_Cmd' || tag.name === 'KNS1_P2_Cmd';
   if (pumpCmd && mem.auto) return finish('rejected', 'КНС в режиме «Автомат» — ПЛК не принимает ручные команды насосам. Переведите в «Ручной».');
   if (tag.name === 'KNS1_P1_Cmd' && scenarios.p1Fault && Number(value)) return finish('failed', 'записано, контрольное чтение: насос не запустился (авария Н-1)');
+  if (tag.name === 'KNS1_P1_Unblock') {
+    // деблокировка: ПЛК снимает защиту, если причина устранена
+    if (row.commandClass === 'critical' && !row.confirmedBy) return finish('rejected', 'критичная команда без второго подтверждения не исполняется');
+    scenarios.p1Fault = false; scenarios.overheat = false;
+    tick();
+    mark('criticalDone');
+    return finish('done', 'записано, защита Н-1 деблокирована');
+  }
 
   const map: Record<string, string> = { KNS1_Level_SP: 'sp', KNS1_P1_Cmd: 'p1', KNS1_P2_Cmd: 'p2', KNS1_Valve1_Cmd: 'v1', KNS1_Auto: 'auto' };
   if (map[tag.name]) mem[map[tag.name]] = tag.dataType === 'bool' ? (Number(value) ? 1 : 0) : Number(value);
@@ -635,9 +762,49 @@ async function executeCommand(body: { tagId: number; value?: number; valueStr?: 
   return finish('done', 'записано, подтверждено чтением');
 }
 
+/** Второе подтверждение: другой пользователь, другой сеанс, право «Критичные команды» на область тега. */
+export function confirmCommand(id: number, login: string, approve: boolean, comment?: string) {
+  const p = awaiting.get(id) ?? bad('Команда уже не ожидает подтверждения (истёк срок или её подтвердили)', 409);
+  if (p.expires <= Date.now()) bad('Срок подтверждения истёк', 409);
+  if (login.toLowerCase() === p.row.requestedBy.toLowerCase() || sessionOf(login) === p.session) bad('Подтверждать должен другой пользователь со своего рабочего места', 403);
+  const area = rtTagArea(p.tag.id);
+  if (!has('cmd.critical', area, login)) bad(`Нет права «Критичные команды» на область «${areaPathOf(area)}»`, 403);
+  awaiting.delete(id);
+  const prev = currentLogin;
+  currentLogin = login;
+  addAudit('command_confirm', `command:${id}`, { approve, author: p.row.requestedBy, tag: p.tag.name, value: p.value, comment });
+  currentLogin = prev;
+  if (!approve) {
+    Object.assign(p.row, { status: 'rejected', result: `отклонена вторым пользователем ${login}${comment ? `: ${comment}` : ''}`, finishedAt: new Date().toISOString() });
+    fire('command', { id, status: p.row.status, result: p.row.result });
+    return;
+  }
+  p.row.confirmedBy = login;
+  p.row.expiresAt = new Date(Date.now() + CMD_TTL * 1000).toISOString();
+  void runCommand(p.row, p.tag, p.value, { confirmation: 'password+comment+second_user' });
+}
+
+/** Для панели прототипа: запросы, ожидающие второго подтверждения. */
+export const awaitingCommands = () => [...awaiting.values()].map((p) => ({
+  id: p.row.id, tagName: p.tag.name, value: p.value, unit: p.tag.unit, requestedBy: p.row.requestedBy, comment: p.row.comment,
+  secondsLeft: Math.max(0, Math.ceil((p.expires - Date.now()) / 1000)),
+}));
+
+function expireAwaiting() {
+  for (const [id, p] of awaiting) {
+    if (p.expires > Date.now()) continue;
+    awaiting.delete(id);
+    Object.assign(p.row, { status: 'expired', result: 'не подтверждена вторым пользователем в отведённое время', finishedAt: new Date().toISOString() });
+    fire('command', { id, status: 'expired', result: p.row.result });
+  }
+}
+
 function alarmAction(action: 'ack' | 'shelve' | 'unshelve', body: { ids: number[]; comment?: string; minutes?: number }) {
-  need('operator');
+  const perm: Perm = action === 'ack' ? 'alarm.ack' : 'alarm.shelve';
+  need(perm);
   if (!body.ids?.length) bad('Не выбраны тревоги');
+  const foreign = body.ids.filter((id) => !has(perm, rtAlarmArea(id)));
+  if (foreign.length) { addAudit('access_denied', 'alarms:' + foreign.join(','), { perm, action }); bad(`Нет права «${PERM_NAME[perm]}» на часть выбранных тревог (${foreign.length})`, 403); }
   if (action === 'shelve' && !body.comment?.trim()) bad('Для снятия с контроля обязателен комментарий');
   const now = Date.now();
   for (const id of body.ids) {
@@ -658,9 +825,12 @@ function alarmAction(action: 'ack' | 'shelve' | 'unshelve', body: { ids: number[
     }
   }
   addAudit('alarm_' + action, 'alarms:' + body.ids.join(','), { comment: body.comment, minutes: body.minutes });
-  if (action === 'ack' && activeAlarms().every((a) => a.acked)) mark('ackAll');
+  if (action === 'ack' && myAlarms().every((a) => a.acked)) mark('ackAll');
   fire('alarm', {});
 }
+
+/** Тревоги, видимые текущему пользователю (по областям). */
+const myAlarms = () => activeAlarms().filter((a) => visible('view', rtTagArea(a.tagId) || ROOT));
 
 function crud<T extends { id: number }>(list: T[], id: number) {
   const i = list.findIndex((x) => x.id === id);
@@ -688,7 +858,7 @@ function putVersioned<T extends { id: number; rowVersion?: number }>(list: T[], 
   const cur = list[i];
   if (body.rowVersion && (cur.rowVersion ?? 1) !== body.rowVersion)
     bad('Объект уже изменил другой пользователь. Обновите страницу и повторите правку.', 409);
-  list[i] = { ...body, id: cur.id, rowVersion: (cur.rowVersion ?? 1) + 1 };
+  list[i] = { ...strip(body), id: cur.id, rowVersion: (cur.rowVersion ?? 1) + 1 };
 }
 
 function uniqueName<T extends { id: number; name?: string; login?: string }>(list: T[], value: string, id?: number, key: 'name' | 'login' = 'name') {
@@ -696,35 +866,191 @@ function uniqueName<T extends { id: number; name?: string; login?: string }>(lis
   if (list.some((x) => x[key] === value.trim() && x.id !== id)) bad('Объект с таким именем уже существует', 409);
 }
 
+/** Публикация требует права «Публикация» на все области, затронутые черновиком. */
+function changeAreas(c: ChangeItem, prev: Snapshot, next: Snapshot): number[] {
+  const inS = (s: Snapshot): number[] => {
+    switch (c.objectType) {
+      case 'device': return s.devices.filter((d) => d.id === c.id).map((d) => d.areaId);
+      case 'tag': return s.tags.filter((t) => t.id === c.id).map((t) => snapTagArea(s, t));
+      case 'alarm': return s.alarmDefs.filter((a) => a.id === c.id).flatMap((a) => s.tags.filter((t) => t.id === a.tagId)).map((t) => snapTagArea(s, t));
+      default: return s.mnemos.filter((m) => m.id === c.id).map((m) => m.areaId);
+    }
+  };
+  const extra = c.objectType === 'device'
+    ? [...prev.tags, ...next.tags].filter((t) => t.deviceId === c.id && t.areaId === null).flatMap((t) => [snapTagArea(prev, t), snapTagArea(next, t)]) : [];
+  return [...new Set([...inS(prev), ...inS(next), ...extra].map((a) => a || ROOT))];
+}
+function checkPublishAreas(prev: Snapshot, next: Snapshot, action: string) {
+  const foreign = diff(prev, next).map((c) => ({ c, areas: changeAreas(c, prev, next).filter((a) => !has('config.publish', a)) }))
+    .filter((x) => x.areas.length).map((x) => ({ objectType: x.c.objectType, id: x.c.id, name: x.c.name, areas: x.areas.map(areaPathOf) }));
+  if (!foreign.length) return;
+  addAudit('publish_denied', 'config', { reason: 'areas', action, foreign });
+  bad(`Нет права «Публикация» на области изменений (${foreign.length}): ${foreign.slice(0, 3).map((f) => `${f.name} — ${f.areas.join(', ')}`).join('; ')}${foreign.length > 3 ? '…' : ''}. Их должен опубликовать инженер с нужными правами.`, 403, { foreign });
+}
+
+function areaDto(a: Area) {
+  return { ...a, path: areaPathOf(a.id),
+    devices: cfg.devices.filter((d) => d.areaId === a.id).length,
+    tags: cfg.tags.filter((t) => draftTagArea(t) === a.id).length,
+    mnemos: cfg.mnemos.filter((m) => !m.deleted && m.areaId === a.id).length };
+}
+
+function assignmentDto(a: DemoAssignment) {
+  return { ...a, roleName: cfg.roles.find((r) => r.id === a.roleId)?.name ?? '?', areaPath: areaPathOf(a.areaId),
+    expired: !!a.validUntil && Date.parse(a.validUntil) <= Date.now() };
+}
+
+function validateAssignment(b: DemoAssignment) {
+  if (!['user', 'group'].includes(b.principalType)) bad('Укажите, кому выдаётся роль');
+  if (!String(b.principal ?? '').trim()) bad(b.principalType === 'user' ? 'Укажите логин' : 'Укажите имя группы AD');
+  const role = cfg.roles.find((r) => r.id === b.roleId) ?? bad('Роль не найдена');
+  if (!cfg.areas.some((a) => a.id === b.areaId)) bad('Область не найдена');
+  const rootOnly = role.permissions.filter((p) => ROOT_ONLY.has(p));
+  if (rootOnly.length && b.areaId !== ROOT) bad(`Права «${rootOnly.map((p) => PERM_NAME[p]).join('», «')}» действуют только на корневой области «${areaPathOf(ROOT)}»`);
+  if (b.validUntil && Date.parse(b.validUntil) <= Date.now()) bad('Срок действия уже прошёл');
+  if (b.principalType === 'user' && !cfg.users.some((u) => u.login.toLowerCase() === b.principal.trim().toLowerCase())) bad(`Пользователь «${b.principal}» не найден`);
+}
+
+/** Нельзя лишить права «Пользователи» самого себя. */
+function selfLockout(apply: () => void) {
+  const backup = structuredClone({ roles: cfg.roles, assignments: cfg.assignments });
+  apply();
+  if (!has('users.manage', ROOT)) {
+    cfg.roles = backup.roles; cfg.assignments = backup.assignments;
+    bad('Нельзя лишить права «Пользователи» самого себя — попросите другого администратора безопасности');
+  }
+}
+
 async function route(method: string, path: string, q: URLSearchParams, body: any): Promise<unknown> {
   // --- авторизация
   if (path === '/api/auth/me') { const m = meDto(); if (!m) bad('Не выполнен вход', 401); return m; }
   if (path === '/api/auth/login') {
     const login = String(body.login ?? '').trim().toLowerCase();
-    const byRole = (['operator', 'engineer', 'admin', 'viewer'] as Role[]).find((r) => r === login);
-    const u = cfg.users.find((x) => x.login === (byRole ? roleUser[byRole] : login));
-    if (!u || !u.enabled) { audit.unshift({ id: auditSeq++, ts: new Date().toISOString(), user: login, action: 'login_failed', object: `user:${login}`, details: {}, ip: '10.0.5.17' }); bad('Неверный логин или пароль. В демо: ivanov, petrova, admin или dispatcher, пароль любой', 401); }
+    const u = cfg.users.find((x) => x.login.toLowerCase() === login);
+    if (!u || !u.enabled) { audit.unshift({ id: auditSeq++, ts: new Date().toISOString(), user: login, action: 'login_failed', object: `user:${login}`, details: {}, ip: '10.0.5.17' }); bad(`Неверный логин или пароль. В демо: ${personas.map((p) => p.login).join(', ')}, пароль любой`, 401); }
     currentLogin = u.login;
     u.lastLoginAt = new Date().toISOString();
-    addAudit('login', `user:${u.login}`);
+    if (u.emergency) {
+      addAudit('emergency_login', `user:${u.login}`, { note: 'вход аварийной локальной учётной записью' });
+      setTimeout(() => fire('systemNotice', { level: 'warning', text: `Вход аварийной локальной учётной записью «${u.login}» с 10.0.5.17` }), 1500);
+    } else addAudit('login', `user:${u.login}`);
     return meDto();
   }
   if (path === '/api/auth/logout') { addAudit('logout', `user:${currentLogin}`); currentLogin = null; return undefined; }
-  if (path === '/api/auth/change-password') { need('viewer'); addAudit('password_change', `user:${currentLogin}`); return undefined; }
+  if (!me()) bad('Не выполнен вход', 401);
+  if (path === '/api/auth/change-password') { addAudit('password_change', `user:${currentLogin}`); return undefined; }
+  if (path === '/api/permissions') return PERMS.map((p) => ({ code: p.code, name: p.name, rootOnly: !!p.rootOnly }));
+  if (path === '/api/areas' && method === 'GET') return cfg.areas.map(areaDto);
+  if (path === '/api/commands/settings') return { ttlSeconds: CMD_TTL, confirmSeconds: CONFIRM_S, criticalConfirmMode: 'second_user' };
 
-  need('viewer');
+  // --- области (сразу, без черновика)
+  if (path === '/api/areas' && method === 'POST') {
+    need('config.edit', 'users.manage');
+    const parent = body.parentId ?? ROOT;
+    if (!has('users.manage', parent)) denyUnless('config.edit', parent, 'area:new');
+    if (!String(body.name ?? '').trim()) bad('Укажите название области');
+    if (cfg.areas.some((a) => a.parentId === parent && a.name === body.name.trim())) bad('Область с таким названием уже есть', 409);
+    const a: Area = { id: nextId(), parentId: parent, name: body.name.trim(), sortOrder: body.sortOrder ?? 0, path: '' };
+    cfg.areas.push(a); saveConfig(); addAudit('area_change', `area:${a.id}`, { op: 'create', path: areaPathOf(a.id) });
+    return { id: a.id };
+  }
+  let m = path.match(/^\/api\/areas\/(\d+)$/);
+  if (m) {
+    need('config.edit', 'users.manage');
+    const id = Number(m[1]); const i = crud(cfg.areas, id); const a = cfg.areas[i];
+    if (!has('users.manage', id)) denyUnless('config.edit', id, `area:${id}`);
+    if (method === 'PUT') {
+      const parent = a.parentId === null ? null : body.parentId ?? a.parentId;
+      if (parent !== null && within(parent, id)) bad('Нельзя перенести область внутрь самой себя');
+      const before = areaPathOf(id);
+      Object.assign(a, { name: String(body.name).trim(), parentId: parent, sortOrder: body.sortOrder ?? 0 });
+      saveConfig(); addAudit('area_change', `area:${id}`, { op: 'update', before, after: areaPathOf(id) }); return undefined;
+    }
+    if (method === 'DELETE') {
+      if (a.parentId === null) bad('Корневую область удалить нельзя');
+      if (cfg.areas.some((x) => x.parentId === id)) bad('В области есть вложенные области', 409);
+      const objs = cfg.devices.filter((d) => d.areaId === id).length + cfg.tags.filter((t) => t.areaId === id).length + cfg.mnemos.filter((x) => !x.deleted && x.areaId === id).length;
+      if (objs) bad(`В области есть объекты черновика (${objs}) — перенесите их`, 409);
+      if (cfg.assignments.some((x) => x.areaId === id)) bad('На область выданы назначения — удалите их', 409);
+      const path0 = areaPathOf(id);
+      cfg.areas.splice(i, 1); saveConfig(); addAudit('area_change', `area:${id}`, { op: 'delete', path: path0 }); return undefined;
+    }
+  }
+
+  // --- роли
+  if (path === '/api/roles' && method === 'GET') { need('users.manage'); return cfg.roles.map((r) => ({ ...r, assignments: cfg.assignments.filter((a) => a.roleId === r.id).length })); }
+  if (path === '/api/roles' && method === 'POST') {
+    need('users.manage'); if (!String(body.name ?? '').trim()) bad('Укажите название роли');
+    if (cfg.roles.some((r) => r.name === body.name.trim())) bad('Роль с таким названием уже есть', 409);
+    const r: DemoRole = { id: nextId(), code: null, name: body.name.trim(), description: body.description ?? '', isSystem: false, permissions: PERMS.map((p) => p.code).filter((c) => body.permissions?.includes(c)) };
+    cfg.roles.push(r); saveConfig(); addAudit('role_change', `role:${r.id}`, { op: 'create', name: r.name, after: r.permissions }); mark('roleCreated'); return { id: r.id };
+  }
+  m = path.match(/^\/api\/roles\/(\d+)$/);
+  if (m) {
+    need('users.manage'); const id = Number(m[1]); const i = crud(cfg.roles, id); const r = cfg.roles[i];
+    if (r.isSystem) bad(method === 'DELETE' ? 'Системную роль удалить нельзя' : 'Системную роль изменить нельзя — скопируйте её в свою и измените копию');
+    if (method === 'PUT') {
+      const before = r.permissions;
+      selfLockout(() => Object.assign(r, { name: body.name.trim(), description: body.description ?? '', permissions: PERMS.map((p) => p.code).filter((c) => body.permissions?.includes(c)) }));
+      saveConfig(); addAudit('role_change', `role:${id}`, { op: 'update', before, after: r.permissions }); return undefined;
+    }
+    if (method === 'DELETE') {
+      if (cfg.assignments.some((a) => a.roleId === id)) bad('Роль выдана в назначениях. Сначала удалите их.', 409);
+      cfg.roles.splice(i, 1); saveConfig(); addAudit('role_change', `role:${id}`, { op: 'delete', name: r.name }); return undefined;
+    }
+  }
+
+  // --- назначения
+  if ((path === '/api/assignments' || path === '/api/ad-groups') && method === 'GET') {
+    need('users.manage');
+    const type = path === '/api/ad-groups' ? 'group' : q.get('principalType'), who = q.get('principal');
+    return cfg.assignments.filter((a) => (!type || a.principalType === type) && (!who || a.principal.toLowerCase() === who.toLowerCase())).map(assignmentDto);
+  }
+  if (path === '/api/assignments' && method === 'POST') {
+    need('users.manage'); validateAssignment(body);
+    if (cfg.assignments.some((a) => a.principalType === body.principalType && a.principal === body.principal.trim() && a.roleId === body.roleId && a.areaId === body.areaId)) bad('Такое назначение уже есть', 409);
+    const a: DemoAssignment = { id: nextId(), principalType: body.principalType, principal: body.principal.trim(), roleId: body.roleId, areaId: body.areaId,
+      validUntil: body.validUntil ?? null, comment: body.comment ?? '', createdAt: new Date().toISOString(), createdBy: currentLogin };
+    cfg.assignments.push(a); saveConfig();
+    addAudit('assignment_change', `assignment:${a.id}`, { op: 'create', after: assignmentDto(a), permissions: cfg.roles.find((r) => r.id === a.roleId)?.permissions });
+    if (a.principal === 'pnr.kuznetsov' && a.roleId === 2 && a.areaId === 4 && a.validUntil) mark('assign');
+    fire('config', 'access');
+    return { id: a.id };
+  }
+  m = path.match(/^\/api\/assignments\/(\d+)$/);
+  if (m) {
+    need('users.manage'); const id = Number(m[1]); const i = crud(cfg.assignments, id); const before = assignmentDto(cfg.assignments[i]);
+    if (method === 'PUT') {
+      validateAssignment(body);
+      selfLockout(() => Object.assign(cfg.assignments[i], { principalType: body.principalType, principal: body.principal.trim(), roleId: body.roleId, areaId: body.areaId, validUntil: body.validUntil ?? null, comment: body.comment ?? '' }));
+      saveConfig(); addAudit('assignment_change', `assignment:${id}`, { op: 'update', before, after: assignmentDto(cfg.assignments[i]) });
+      const a = cfg.assignments[i];
+      if (a.principal === 'pnr.kuznetsov' && a.roleId === 2 && a.areaId === 4 && a.validUntil) mark('assign');
+      return undefined;
+    }
+    if (method === 'DELETE') {
+      selfLockout(() => cfg.assignments.splice(i, 1));
+      saveConfig(); addAudit('assignment_change', `assignment:${id}`, { op: 'delete', before }); return undefined;
+    }
+  }
+  if (path === '/api/directory/status') { need('users.manage'); return { enabled: false, lastOkAt: null, lastErrorAt: null, lastError: null }; }
+  if (path === '/api/directory/test') bad('Интеграция с AD выключена (в прототипе домена нет)');
 
   // --- устройства
-  if (path === '/api/devices' && method === 'GET') return devicesDto();
+  if (path === '/api/devices' && method === 'GET') { need('view'); return devicesDto(); }
   if (path === '/api/devices' && method === 'POST') {
-    need('engineer'); uniqueName(cfg.devices, body.name);
-    const d = { ...body, id: nextId(), name: body.name.trim(), rowVersion: 1 } as Device;
+    need('config.edit'); denyUnless('config.edit', body.areaId ?? ROOT, 'device:new'); uniqueName(cfg.devices, body.name);
+    const d = { ...strip(body), id: nextId(), name: body.name.trim(), rowVersion: 1, areaId: body.areaId ?? ROOT } as Device;
     cfg.devices.push(d); configChanged('devices', `device:${d.id}`, { op: 'create', name: d.name }); return { id: d.id };
   }
-  let m = path.match(/^\/api\/devices\/(\d+)$/);
+  m = path.match(/^\/api\/devices\/(\d+)$/);
   if (m) {
-    need('engineer'); const id = Number(m[1]); const i = crud(cfg.devices, id);
-    if (method === 'PUT') { uniqueName(cfg.devices, body.name, id); putVersioned(cfg.devices, i, body); configChanged('devices', `device:${id}`, { op: 'update', name: body.name }); return undefined; }
+    need('config.edit'); const id = Number(m[1]); const i = crud(cfg.devices, id);
+    denyUnless('config.edit', cfg.devices[i].areaId, `device:${id}`);
+    if (method === 'PUT') {
+      denyUnless('config.edit', body.areaId ?? ROOT, `device:${id}`);
+      uniqueName(cfg.devices, body.name, id); putVersioned(cfg.devices, i, body); configChanged('devices', `device:${id}`, { op: 'update', name: body.name }); return undefined;
+    }
     if (method === 'DELETE') {
       if (cfg.tags.some((t) => t.deviceId === id)) bad('Есть связанные объекты: сначала удалите теги устройства', 409);
       const [d] = cfg.devices.splice(i, 1); configChanged('devices', `device:${id}`, { op: 'delete', name: d.name }); return undefined;
@@ -733,25 +1059,32 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
 
   // --- теги
   if (path === '/api/tags' && method === 'GET') {
+    need('view');
     const dev = q.get('deviceId');
-    return cfg.tags.filter((t) => !dev || t.deviceId === Number(dev)).slice().sort((a, b) => a.name.localeCompare(b.name));
+    return cfg.tags.filter((t) => (!dev || t.deviceId === Number(dev)) && visible('view', draftTagArea(t))).sort((a, b) => a.name.localeCompare(b.name)).map(tagDto);
   }
   if (path === '/api/tags' && method === 'POST') {
-    need('engineer'); uniqueName(cfg.tags, body.name);
+    need('config.edit');
+    denyUnless('config.edit', body.areaId ?? cfg.devices.find((d) => d.id === body.deviceId)?.areaId ?? ROOT, 'tag:new');
+    uniqueName(cfg.tags, body.name);
     if (!body.address?.trim()) bad('Недопустимое значение: адрес не задан');
-    const t = { ...body, id: nextId(), name: body.name.trim(), rowVersion: 1 } as Tag;
+    const t = { ...strip(body), id: nextId(), name: body.name.trim(), rowVersion: 1, areaId: body.areaId ?? null, commandClass: body.commandClass ?? 'normal' } as Tag;
     cfg.tags.push(t); configChanged('tags', `tag:${t.id}`, { op: 'create', name: t.name }); return { id: t.id };
   }
   if (path === '/api/tags/import' && method === 'POST') {
-    need('engineer');
+    need('config.edit');
     return importCsv(String(body ?? ''));
   }
   m = path.match(/^\/api\/tags\/(\d+)$/);
   if (m) {
     const id = Number(m[1]); const i = crud(cfg.tags, id);
-    if (method === 'GET') return cfg.tags[i];
-    need('engineer');
-    if (method === 'PUT') { uniqueName(cfg.tags, body.name, id); putVersioned(cfg.tags, i, body); configChanged('tags', `tag:${id}`, { op: 'update', name: body.name }); return undefined; }
+    if (method === 'GET') { if (!visible('view', draftTagArea(cfg.tags[i]))) bad('Не найдено', 404); return tagDto(cfg.tags[i]); }
+    need('config.edit');
+    denyUnless('config.edit', draftTagArea(cfg.tags[i]), `tag:${id}`);
+    if (method === 'PUT') {
+      denyUnless('config.edit', body.areaId ?? cfg.devices.find((d) => d.id === body.deviceId)?.areaId ?? ROOT, `tag:${id}`);
+      uniqueName(cfg.tags, body.name, id); putVersioned(cfg.tags, i, body); configChanged('tags', `tag:${id}`, { op: 'update', name: body.name }); return undefined;
+    }
     if (method === 'DELETE') {
       if (cfg.alarmDefs.some((a) => a.tagId === id)) bad('Есть связанные объекты: у тега настроены тревоги', 409);
       const [t] = cfg.tags.splice(i, 1); configChanged('tags', `tag:${id}`, { op: 'delete', name: t.name }); return undefined;
@@ -760,37 +1093,56 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
 
   // --- уставки тревог
   if (path === '/api/alarm-defs' && method === 'GET') {
+    need('view');
     const tagId = q.get('tagId');
-    return cfg.alarmDefs.filter((a) => !tagId || a.tagId === Number(tagId));
+    return cfg.alarmDefs.filter((a) => (!tagId || a.tagId === Number(tagId)) && visible('view', draftTagAreaById(a.tagId)));
   }
   if (path === '/api/alarm-defs' && method === 'POST') {
-    need('engineer'); const a = { ...body, id: nextId(), rowVersion: 1 } as AlarmDef;
+    need('config.edit'); denyUnless('config.edit', draftTagAreaById(body.tagId), 'alarm_def:new');
+    const a = { ...body, id: nextId(), rowVersion: 1 } as AlarmDef;
     cfg.alarmDefs.push(a); configChanged('alarm_defs', `alarm_def:${a.id}`, { op: 'create', name: a.message }); return { id: a.id };
   }
   m = path.match(/^\/api\/alarm-defs\/(\d+)$/);
   if (m) {
-    need('engineer'); const id = Number(m[1]); const i = crud(cfg.alarmDefs, id);
-    if (method === 'PUT') { putVersioned(cfg.alarmDefs, i, body); configChanged('alarm_defs', `alarm_def:${id}`, { op: 'update', name: body.message }); return undefined; }
+    need('config.edit'); const id = Number(m[1]); const i = crud(cfg.alarmDefs, id);
+    denyUnless('config.edit', draftTagAreaById(cfg.alarmDefs[i].tagId), `alarm_def:${id}`);
+    if (method === 'PUT') { denyUnless('config.edit', draftTagAreaById(body.tagId), `alarm_def:${id}`); putVersioned(cfg.alarmDefs, i, body); configChanged('alarm_defs', `alarm_def:${id}`, { op: 'update', name: body.message }); return undefined; }
     if (method === 'DELETE') { const [a] = cfg.alarmDefs.splice(i, 1); configChanged('alarm_defs', `alarm_def:${id}`, { op: 'delete', name: a.message }); return undefined; }
   }
 
   // --- тревоги
-  if (path === '/api/alarms/active') return activeAlarms();
+  if (path === '/api/alarms/active') { need('view'); return myAlarms(); }
   if (path === '/api/alarms/events') {
+    need('view');
     const from = Date.parse(q.get('from') ?? '') || Date.now() - 86400000, to = Date.parse(q.get('to') ?? '') || Date.now();
-    return alarmEvents.filter((e) => { const t = Date.parse(e.ts); return t >= from && t <= to; }).slice(0, Number(q.get('limit') ?? 500));
+    return alarmEvents.filter((e) => { const t = Date.parse(e.ts); return t >= from && t <= to && visible('view', rtAlarmArea(e.alarmId) || ROOT); }).slice(0, Number(q.get('limit') ?? 500));
   }
   if (path === '/api/alarms/ack') { alarmAction('ack', body); return undefined; }
   if (path === '/api/alarms/shelve') { alarmAction('shelve', body); return undefined; }
   if (path === '/api/alarms/unshelve') { alarmAction('unshelve', body); return undefined; }
 
   // --- команды
-  if (path === '/api/commands' && method === 'POST') return executeCommand(body);
-  if (path === '/api/commands') return commands.slice(0, Number(q.get('limit') ?? 100));
+  if (path === '/api/commands' && method === 'POST') { need('cmd.control', 'cmd.setpoint', 'cmd.critical'); return executeCommand(body); }
+  if (path === '/api/commands/awaiting') {
+    need('cmd.critical');
+    return [...awaiting.values()].filter((p) => p.expires > Date.now() && p.row.requestedBy !== currentLogin && has('cmd.critical', rtTagArea(p.tag.id)))
+      .map((p) => ({ id: p.row.id, tagId: p.tag.id, tagName: p.tag.name, tagDescription: p.tag.description, unit: p.tag.unit, valueNum: p.row.valueNum,
+        valueStr: p.row.valueStr, currentValue: current.get(p.tag.id)?.[1] ?? null, requestedBy: p.row.requestedBy, requestedAt: p.row.requestedAt,
+        expiresAt: new Date(p.expires).toISOString(), comment: p.row.comment, areaPath: areaPathOf(rtTagArea(p.tag.id)) }));
+  }
+  m = path.match(/^\/api\/commands\/(\d+)\/confirm$/);
+  if (m) {
+    need('cmd.critical');
+    if (!String(body.password ?? '')) bad('Неверный пароль', 403);
+    confirmCommand(Number(m[1]), currentLogin!, body.approve !== false, body.comment);
+    return undefined;
+  }
+  if (path === '/api/commands') { need('view'); return commands.filter((c) => visible('view', rtTagArea(c.tagId) || ROOT)).slice(0, Number(q.get('limit') ?? 100)); }
 
   // --- архив
   if (path === '/api/history') {
-    const ids = (q.get('tagIds') ?? '').split(',').map(Number).filter((x) => x > 0);
+    need('view');
+    const ids = (q.get('tagIds') ?? '').split(',').map(Number).filter((x) => x > 0 && visible('view', rtTagArea(x) || ROOT));
     if (!ids.length || ids.length > 16) bad('Укажите от 1 до 16 тегов');
     const from = Date.parse(q.get('from') ?? ''), to = Date.parse(q.get('to') ?? '');
     if (!(to > from)) bad('Неверный интервал');
@@ -799,25 +1151,31 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
     return historyQuery(ids, from, to, Math.min(5000, Math.max(50, Number(q.get('points') ?? 1000))));
   }
 
-  // --- мнемосхемы: операторам — опубликованная версия, редактору (?draft=1) — черновик
+  // --- мнемосхемы: операторам — опубликованная версия, редактору (?draft=1) — черновик; чужие области не показываются
   if (path === '/api/mnemos' && method === 'GET') {
+    need('view');
     const order = (a: { parentId: number | null; sortOrder: number; name: string }, b: typeof a) =>
       Number(a.parentId !== null) - Number(b.parentId !== null) || a.sortOrder - b.sortOrder || a.name.localeCompare(b.name);
-    if (q.get('draft')) { need('engineer'); return cfg.mnemos.filter((x) => !x.deleted).sort(order).map(mnemoDto); }
-    return rt.mnemos.slice().sort(order).map((r) => {
+    if (q.get('draft')) { need('mnemo.edit'); return cfg.mnemos.filter((x) => !x.deleted && visible('view', x.areaId)).sort(order).map(mnemoDto); }
+    return rt.mnemos.filter((r) => visible('view', r.areaId || ROOT)).sort(order).map((r) => {
       const v = cfg.mnemos.find((x) => x.id === r.id)?.versions.find((x) => x.version === r.version);
       return { ...r, currentVersion: r.version, publishedVersion: r.version, updatedAt: v?.createdAt ?? published().createdAt, updatedBy: v?.createdBy ?? null };
     });
   }
   if (path === '/api/mnemos' && method === 'POST') {
-    need('engineer'); if (!body.name?.trim()) bad('Укажите название');
+    need('mnemo.edit'); if (!body.name?.trim()) bad('Укажите название');
+    const area = body.areaId ?? (body.parentId ? cfg.mnemos.find((x) => x.id === body.parentId)?.areaId : undefined) ?? ROOT;
+    denyUnless('mnemo.edit', area, 'mnemo:new');
     const at = new Date().toISOString();
-    const rec: MnemoRec = { id: nextId(), name: body.name.trim(), parentId: body.parentId ?? null, sortOrder: body.sortOrder ?? 0, versions: [], updatedAt: at, updatedBy: currentLogin! };
+    const rec: MnemoRec = { id: nextId(), name: body.name.trim(), parentId: body.parentId ?? null, sortOrder: body.sortOrder ?? 0, areaId: area, versions: [], updatedAt: at, updatedBy: currentLogin! };
     cfg.mnemos.push(rec); configChanged('mnemos', `mnemo:${rec.id}`, { op: 'create', name: rec.name }); return { id: rec.id };
   }
   m = path.match(/^\/api\/mnemos\/(\d+)(\/doc|\/versions)?$/);
   if (m) {
+    need('view');
     const id = Number(m[1]); const i = crud(cfg.mnemos, id); const rec = cfg.mnemos[i];
+    const pubRef = rt.mnemos.find((x) => x.id === id);
+    if (!visible('view', (q.get('draft') || !pubRef ? rec.areaId : pubRef.areaId) || ROOT)) bad('Не найдено', 404);
     if (m[2] === '/versions') return rec.versions.slice().reverse().map((v) => ({ version: v.version, createdAt: v.createdAt, createdBy: v.createdBy }));
     if (method === 'GET') {
       if (id === 2) mark('kns2');
@@ -825,14 +1183,15 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
       if (q.get('version')) ver = rec.versions.find((v) => v.version === Number(q.get('version')));
       else if (q.get('draft')) { if (rec.deleted) bad('Не найдено', 404); ver = rec.versions.at(-1); }
       else {
-        const pub = rt.mnemos.find((x) => x.id === id) ?? bad('Схема ещё не опубликована', 404);
+        const pub = pubRef ?? bad('Схема ещё не опубликована', 404);
         ver = rec.versions.find((v) => v.version === pub.version);
-        return { id, name: pub.name, version: pub.version, doc: ver?.doc ?? null };
+        return { id, name: pub.name, version: pub.version, doc: ver?.doc ?? null, areaId: pub.areaId };
       }
-      return { id, name: rec.name, version: ver?.version ?? 0, doc: ver?.doc ?? null };
+      return { id, name: rec.name, version: ver?.version ?? 0, doc: ver?.doc ?? null, areaId: rec.areaId };
     }
-    need('engineer');
+    need('mnemo.edit');
     if (rec.deleted) bad('Не найдено', 404);
+    denyUnless('mnemo.edit', rec.areaId, `mnemo:${id}`);
     if (m[2] === '/doc' && method === 'PUT') {
       const cur = rec.versions.at(-1)?.version ?? 0;
       if (cur !== body.baseVersion) bad(`Схему уже изменили (версия ${cur}). Обновите редактор и повторите.`, 409);
@@ -842,7 +1201,12 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
       configChanged('mnemos', `mnemo:${id}`, { op: 'save', name: rec.name });
       return { version: cur + 1 };
     }
-    if (method === 'PUT') { rec.name = body.name.trim(); rec.parentId = body.parentId ?? null; rec.sortOrder = body.sortOrder ?? 0; configChanged('mnemos', `mnemo:${id}`, { op: 'rename', name: rec.name }); return undefined; }
+    if (method === 'PUT') {
+      const area = body.areaId ?? rec.areaId;
+      denyUnless('mnemo.edit', area, `mnemo:${id}`);
+      rec.name = body.name.trim(); rec.parentId = body.parentId ?? null; rec.sortOrder = body.sortOrder ?? 0; rec.areaId = area;
+      configChanged('mnemos', `mnemo:${id}`, { op: 'rename', name: rec.name }); return undefined;
+    }
     if (method === 'DELETE') { rec.deleted = true; cfg.mnemos.forEach((x) => { if (x.parentId === id) x.parentId = null; }); configChanged('mnemos', `mnemo:${id}`, { op: 'delete', name: rec.name }); return undefined; }
   }
 
@@ -853,18 +1217,22 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
     return { publishedVersion: v.version, publishedAt: v.createdAt, publishedBy: v.createdBy, appliedAt: v.appliedAt,
       draftChanges: changes.length, draftAuthors: [...new Set(cfg.draftLog.map((l) => l.user))] };
   }
-  if (path === '/api/draft/diff') {
-    need('engineer');
-    const changes = diff(rt, draftSnapshot());
-    const { errors, warnings } = validate(draftSnapshot(), rt);
+  if (path === '/api/draft/diff' || path === '/api/draft/validate') {
+    need('config.edit', 'mnemo.edit', 'config.publish');
+    const next = draftSnapshot();
+    const changes = diff(rt, next);
+    const { errors, warnings } = validate(next, rt);
     return { baseVersion: published().version, summary: summarize(changes), errors, warnings,
       changes: changes.map((c) => {
         const log = cfg.draftLog.filter((l) => l.type === c.objectType && l.id === c.id);
-        return { change: c, authors: [...new Set(log.map((l) => l.user))], lastAt: log.at(-1)?.ts ?? null };
+        const areas = changeAreas(c, rt, next);
+        return { change: c, authors: [...new Set(log.map((l) => l.user))], lastAt: log.at(-1)?.ts ?? null,
+          areas: areas.map(areaPathOf), canPublish: areas.every((a) => has('config.publish', a)) };
       }) };
   }
   if (path === '/api/draft/discard' && method === 'POST') {
-    need('engineer'); checkPassword(body.password, 'draft_discard');
+    need('config.publish'); checkPassword(body.password, 'draft_discard');
+    checkPublishAreas(rt, draftSnapshot(), 'discard');
     const n = diff(rt, draftSnapshot()).length;
     restore(rt);
     addAudit('draft_discard', 'config', { discarded: n });
@@ -872,26 +1240,29 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
     return { discarded: n };
   }
   if (path === '/api/publish' && method === 'POST') {
-    need('engineer'); checkPassword(body.password, 'config_publish');
+    need('config.publish'); checkPassword(body.password, 'config_publish');
     if (body.baseVersion !== published().version) bad(`Пока вы проверяли изменения, опубликована версия ${published().version}. Список изменений обновлён — проверьте его ещё раз.`, 409);
     if (!String(body.comment ?? '').trim()) bad('Укажите причину изменения');
     const next = draftSnapshot();
     if (!diff(rt, next).length) bad('Нет изменений для публикации');
+    checkPublishAreas(rt, next, 'publish');
     const { errors, warnings } = validate(next, rt);
     if (errors.length) bad(`Публикация невозможна: ошибок — ${errors.length}`, 422, { errors, warnings });
     if (warnings.length && !body.acceptWarnings) bad(`Подтвердите, что ознакомлены с предупреждениями (${warnings.length})`, 428, { errors, warnings });
     return { version: publishSnapshot(next, String(body.comment).trim(), warnings.length, null) };
   }
-  if (path === '/api/versions' && method === 'GET') { need('engineer'); return cfg.versions.slice().reverse().map(versionDto); }
+  if (path === '/api/versions' && method === 'GET') { need('config.edit', 'mnemo.edit', 'config.publish'); return cfg.versions.slice().reverse().map(versionDto); }
   m = path.match(/^\/api\/versions\/(\d+)(\/rollback)?$/);
   if (m) {
-    need('engineer');
+    need('config.edit', 'mnemo.edit', 'config.publish');
     const target = cfg.versions.find((v) => v.version === Number(m![1])) ?? bad('Версия не найдена', 404);
     if (!m[2]) return { ...versionDto(target), changes: target.changes };
+    need('config.publish');
     checkPassword(body.password, 'config_rollback');
     if (!String(body.comment ?? '').trim()) bad('Укажите причину отката');
     if (target.version === published().version) bad('Эта версия уже работает на объекте');
     if (diff(rt, draftSnapshot()).length && !body.discardDraft) bad('В черновике есть неопубликованные правки. Отметьте «Сбросить черновик» или сначала опубликуйте их.', 409);
+    checkPublishAreas(rt, target.snapshot, 'rollback');
     const { errors, warnings } = validate(target.snapshot, rt);
     if (errors.length) bad(`Откат невозможен: ошибок — ${errors.length}`, 422, { errors, warnings });
     if (warnings.length && !body.acceptWarnings) bad(`Подтвердите, что ознакомлены с предупреждениями (${warnings.length})`, 428, { errors, warnings });
@@ -899,45 +1270,53 @@ async function route(method: string, path: string, q: URLSearchParams, body: any
     return { version: publishSnapshot(draftSnapshot(), String(body.comment).trim(), warnings.length, target.version) };
   }
 
-  // --- пользователи
-  if (path === '/api/users' && method === 'GET') { need('admin'); return cfg.users; }
+  // --- пользователи (права — назначениями)
+  if (path === '/api/users' && method === 'GET') {
+    need('users.manage');
+    return cfg.users.map((u) => ({ ...u, roles: cfg.assignments.filter((a) => a.principalType === 'user' && a.principal === u.login)
+      .map((a) => `${cfg.roles.find((r) => r.id === a.roleId)?.name ?? '?'} — ${areaPathOf(a.areaId)}${a.validUntil ? ` (до ${new Date(a.validUntil).toLocaleDateString('ru-RU')})` : ''}`) }));
+  }
   if (path === '/api/users' && method === 'POST') {
-    need('admin'); uniqueName(cfg.users, body.login, undefined, 'login');
+    need('users.manage'); uniqueName(cfg.users, body.login, undefined, 'login');
     if (String(body.password ?? '').length < 8) bad('Пароль должен быть не короче 8 символов');
-    const u: DemoUser = { id: nextId(), login: body.login.trim(), displayName: body.displayName, role: body.role, enabled: body.enabled, mustChangePassword: true, createdAt: new Date().toISOString(), lastLoginAt: null };
-    cfg.users.push(u); saveConfig(); addAudit('user_change', `user:${u.login}`, { op: 'create', role: u.role }); return { id: u.id };
+    const u: DemoUser = { id: nextId(), login: body.login.trim(), displayName: body.displayName, source: 'local', emergency: !!body.emergency, roles: [],
+      enabled: body.enabled, mustChangePassword: true, createdAt: new Date().toISOString(), lastLoginAt: null };
+    cfg.users.push(u); saveConfig(); addAudit('user_change', `user:${u.login}`, { op: 'create', emergency: u.emergency }); return { id: u.id };
   }
   m = path.match(/^\/api\/users\/(\d+)$/);
   if (m) {
-    need('admin'); const id = Number(m[1]); const i = crud(cfg.users, id); const u = cfg.users[i];
+    need('users.manage'); const id = Number(m[1]); const i = crud(cfg.users, id); const u = cfg.users[i];
     if (method === 'PUT') {
-      if (u.login === currentLogin && (body.role !== 'admin' || !body.enabled)) bad('Нельзя лишить прав администратора самого себя');
+      if (u.login === currentLogin && !body.enabled) bad('Нельзя отключить самого себя');
       if (body.password && String(body.password).length < 8) bad('Пароль должен быть не короче 8 символов');
-      Object.assign(u, { displayName: body.displayName, role: body.role, enabled: body.enabled, mustChangePassword: body.password ? true : u.mustChangePassword });
-      saveConfig(); addAudit('user_change', `user:${u.login}`, { op: 'update', role: u.role, enabled: u.enabled }); return undefined;
+      Object.assign(u, { displayName: body.displayName, enabled: body.enabled, emergency: !!body.emergency, mustChangePassword: body.password ? true : u.mustChangePassword });
+      saveConfig(); addAudit('user_change', `user:${u.login}`, { op: 'update', enabled: u.enabled, emergency: u.emergency, passwordReset: !!body.password }); return undefined;
     }
     if (method === 'DELETE') {
       if (u.login === currentLogin) bad('Нельзя удалить самого себя');
-      cfg.users.splice(i, 1); saveConfig(); addAudit('user_change', `user:${u.login}`, { op: 'delete' }); return undefined;
+      const removed = cfg.assignments.filter((a) => a.principalType === 'user' && a.principal === u.login).length;
+      cfg.assignments = cfg.assignments.filter((a) => !(a.principalType === 'user' && a.principal === u.login));
+      cfg.users.splice(i, 1); saveConfig(); addAudit('user_change', `user:${u.login}`, { op: 'delete', assignmentsRemoved: removed }); return undefined;
     }
   }
 
   // --- аудит и диагностика
   if (path === '/api/audit') {
-    need('engineer');
+    need('audit.view');
     const action = q.get('action');
     return audit.filter((a) => !action || a.action === action).slice(0, Number(q.get('limit') ?? 500));
   }
-  if (path === '/api/audit/verify') { need('admin'); return { intact: true, firstBrokenId: null }; }
+  if (path === '/api/audit/verify') { need('audit.view'); return { intact: true, firstBrokenId: null }; }
   if (path === '/api/diagnostics') {
+    need('view');
     mark('kns2');
     return {
-      web: { listenerConnected: true, cachedValues: current.size, connections: 3, version: '0.1.0-demo' },
+      web: { listenerConnected: true, cachedValues: current.size, connections: 3, version: '0.2.0-demo' },
       acquisition: { lastHeartbeatAt: new Date(lastHb || Date.now()).toISOString(), heartbeat: { tags: rt.tags.length, devices: rt.devices.length, historianQueue: 0, spoolBytes: 0 } },
       db: { dbBytes: 412 * 1048576, tags: cfg.tags.length, devices: cfg.devices.length, activeAlarms: activeAlarms().filter((a) => a.active).length, historyPartitions: 4 },
     };
   }
-  if (path === '/api/values') return [...current.values()].filter((v) => rt.tags.some((t) => t.id === v[0]));
+  if (path === '/api/values') { need('view'); return [...current.values()].filter((v) => rt.tags.some((t) => t.id === v[0]) && visible('view', rtTagArea(v[0]) || ROOT)); }
   bad('Не найдено', 404);
 }
 
@@ -958,6 +1337,8 @@ function importCsv(text: string) {
     if (!['bool', 'int16', 'uint16', 'int32', 'uint32', 'float32', 'float64', 'string'].includes(g('data_type'))) { errors.push(`Строка ${i + 2}: тип «${g('data_type')}» не поддерживается`); return; }
     const num = (c: string) => (g(c) === '' ? null : Number(g(c).replace(',', '.')));
     const existing = cfg.tags.find((t) => t.name === g('name'));
+    if (existing && !has('config.edit', draftTagArea(existing))) { errors.push(`Строка ${i + 2}: тег уже есть в области «${areaPathOf(draftTagArea(existing))}», на которую нет права «Конфигурация»`); return; }
+    if (!has('config.edit', dev.areaId)) { errors.push(`Строка ${i + 2}: нет права «Конфигурация» на область «${areaPathOf(dev.areaId)}»`); return; }
     rows.push({ ...(existing ?? tagsSeed[0]), id: existing?.id ?? 0, name: g('name'), description: g('description'), deviceId: dev.id, address: g('address'),
       dataType: g('data_type') as Tag['dataType'], unit: g('unit'), rawLow: num('raw_low'), rawHigh: num('raw_high'), engLow: num('eng_low'), engHigh: num('eng_high'),
       writable: ['1', 'true', 'да'].includes(g('writable').toLowerCase()), writeMin: num('write_min'), writeMax: num('write_max') });

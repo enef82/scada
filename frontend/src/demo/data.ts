@@ -1,6 +1,6 @@
 // Исходные данные демо-режима: те же устройства, теги, тревоги и схемы, что в db/002_demo.sql,
 // плюс тег режима «Автомат» и обзорная схема.
-import type { AlarmDef, Device, Role, Tag, UserRow } from '../lib/types';
+import type { AlarmDef, Area, Device, Perm, Tag, UserRow } from '../lib/types';
 import type { MnemoDoc, MnemoElement } from '../mnemo/model';
 import seedMnemos from './mnemos.json';
 
@@ -8,12 +8,12 @@ export const devicesSeed: Device[] = [
   {
     id: 1, name: 'ПЛК КНС-1', protocol: 'modbus_tcp', endpoint: '192.168.10.21:502',
     settings: { unitId: 1, byteOrder: 'ABCD' }, enabled: true, pollMs: 500, timeoutMs: 1000,
-    description: 'Шкаф управления насосами, щит ЩУ-1',
+    description: 'Шкаф управления насосами, щит ЩУ-1', areaId: 3,
   },
   {
     id: 2, name: 'ПЛК КНС-2', protocol: 'modbus_tcp', endpoint: '192.168.10.22:502',
     settings: { unitId: 1, byteOrder: 'ABCD' }, enabled: true, pollMs: 1000, timeoutMs: 1500,
-    description: 'Связь через GSM-модем',
+    description: 'Связь через GSM-модем', areaId: 4,
   },
 ];
 
@@ -23,6 +23,7 @@ const base: Omit<Tag, 'id' | 'name' | 'description' | 'deviceId' | 'address' | '
   unit: '', rawLow: null, rawHigh: null, engLow: null, engHigh: null, pollMs: null, staleAfterMs: null,
   deadbandUi: 0, deadbandArchive: 0, archiveMode: 'change', archiveIntervalS: 60,
   writable: false, writeMin: null, writeMax: null, writeConfirm: true, enabled: true,
+  areaId: null, commandClass: 'normal', effectiveAreaId: 0,
 };
 
 const tagList: TagSeed[] = [
@@ -39,11 +40,12 @@ const tagList: TagSeed[] = [
   { name: 'KNS1_Pressure', description: 'Давление в напорном коллекторе', deviceId: 1, address: 'ir:6:cdab', dataType: 'float32', unit: 'бар', deadbandUi: 0.01, deadbandArchive: 0.02 },
   { name: 'KNS1_Flow', description: 'Расход', deviceId: 1, address: 'ir:8:cdab', dataType: 'float32', unit: 'м³/ч', deadbandUi: 1, deadbandArchive: 2, archiveMode: 'interval', archiveIntervalS: 10 },
   { name: 'KNS1_Valve1_Open', description: 'ЗД-1 открыта', deviceId: 1, address: 'di:3', dataType: 'bool' },
-  { name: 'KNS1_Valve1_Cmd', description: 'ЗД-1 команда откр./закр.', deviceId: 1, address: 'co:2', dataType: 'bool', writable: true, archiveMode: 'none' },
+  { name: 'KNS1_Valve1_Cmd', description: 'ЗД-1 напорная задвижка, команда откр./закр.', deviceId: 1, address: 'co:2', dataType: 'bool', writable: true, archiveMode: 'none', commandClass: 'important' },
   { name: 'KNS1_Door', description: 'Дверь КНС открыта', deviceId: 1, address: 'di:4', dataType: 'bool' },
   { name: 'KNS2_Level', description: 'КНС-2 уровень', deviceId: 2, address: 'hr:0', dataType: 'float32', unit: 'м', deadbandUi: 0.01, deadbandArchive: 0.01 },
   { name: 'KNS2_P1_Run', description: 'КНС-2 Н-1 в работе', deviceId: 2, address: 'co:0', dataType: 'bool' },
   { name: 'KNS1_Auto', description: 'КНС-1 режим «Автомат»', deviceId: 1, address: 'co:5', dataType: 'bool', writable: true },
+  { name: 'KNS1_P1_Unblock', description: 'Н-1 деблокировка защиты по перегреву', deviceId: 1, address: 'co:6', dataType: 'bool', writable: true, archiveMode: 'none', commandClass: 'critical' },
 ];
 
 export const tagsSeed: Tag[] = tagList.map((t, i) => ({ ...base, ...t, id: i + 1 }) as Tag);
@@ -66,14 +68,63 @@ export const alarmDefsSeed: AlarmDef[] = [
 export interface DemoUser extends UserRow { password?: string }
 
 const now = new Date().toISOString();
+const u = (id: number, login: string, displayName: string, extra: Partial<DemoUser> = {}): DemoUser =>
+  ({ id, login, displayName, source: 'local', emergency: false, roles: [], enabled: true, mustChangePassword: false, createdAt: now, lastLoginAt: null, ...extra });
 export const usersSeed: DemoUser[] = [
-  { id: 1, login: 'ivanov', displayName: 'Иванов С. П.', role: 'operator', enabled: true, mustChangePassword: false, createdAt: now, lastLoginAt: now },
-  { id: 2, login: 'petrova', displayName: 'Петрова А. В.', role: 'engineer', enabled: true, mustChangePassword: false, createdAt: now, lastLoginAt: null },
-  { id: 3, login: 'admin', displayName: 'Администратор', role: 'admin', enabled: true, mustChangePassword: false, createdAt: now, lastLoginAt: null },
-  { id: 4, login: 'dispatcher', displayName: 'Диспетчер района', role: 'viewer', enabled: true, mustChangePassword: false, createdAt: now, lastLoginAt: null },
+  u(1, 'ivanov', 'Иванов С. П.', { lastLoginAt: now }),
+  u(2, 'sidorov', 'Сидоров К. Н.'),
+  u(3, 'petrova', 'Петрова А. В.'),
+  u(4, 'pnr.kuznetsov', 'Кузнецов Д. (наладчик ПНР)'),
+  u(5, 'admin', 'Администратор безопасности'),
+  u(6, 'dispatcher', 'Диспетчер района'),
+  u(7, 'avar.operator', 'Аварийная запись оператора', { emergency: true }),
+  u(8, 'smirnova', 'Смирнова Е. А. (ст. оператор, смена Б)'),
 ];
 
-export const roleUser: Record<Role, string> = { operator: 'ivanov', engineer: 'petrova', admin: 'admin', viewer: 'dispatcher' };
+export const areasSeed: Area[] = [
+  { id: 1, parentId: null, name: 'Установка', sortOrder: 0, path: '' },
+  { id: 2, parentId: 1, name: 'Водоотведение', sortOrder: 1, path: '' },
+  { id: 3, parentId: 2, name: 'КНС-1', sortOrder: 1, path: '' },
+  { id: 4, parentId: 2, name: 'КНС-2', sortOrder: 2, path: '' },
+  { id: 5, parentId: 1, name: 'Водоснабжение', sortOrder: 2, path: '' },
+];
+
+export interface DemoRole { id: number; code: string | null; name: string; description: string; isSystem: boolean; permissions: Perm[] }
+export const rolesSeed: DemoRole[] = [
+  { id: 1, code: 'viewer', name: 'Наблюдатель', isSystem: true, description: 'Просмотр схем, значений, трендов и тревог', permissions: ['view'] },
+  { id: 2, code: 'operator', name: 'Оператор', isSystem: true, description: 'Управление оборудованием и квитирование тревог', permissions: ['view', 'alarm.ack', 'cmd.control', 'cmd.setpoint'] },
+  { id: 3, code: 'senior_operator', name: 'Старший оператор', isSystem: true, description: 'Оператор + снятие тревог с контроля и критичные команды', permissions: ['view', 'alarm.ack', 'alarm.shelve', 'cmd.control', 'cmd.setpoint', 'cmd.critical'] },
+  { id: 4, code: 'commissioner', name: 'Наладчик', isSystem: true, description: 'Готовит изменения конфигурации и схем, не публикует', permissions: ['view', 'config.edit', 'mnemo.edit'] },
+  { id: 5, code: 'engineer', name: 'Инженер', isSystem: true, description: 'Конфигурация, схемы, публикация, аудит', permissions: ['view', 'config.edit', 'mnemo.edit', 'config.publish', 'audit.view'] },
+  { id: 6, code: 'security_admin', name: 'Администратор безопасности', isSystem: true, description: 'Пользователи, роли, назначения, аудит. Не управляет оборудованием', permissions: ['view', 'users.manage', 'audit.view'] },
+];
+
+export interface DemoAssignment { id: number; principalType: 'user' | 'group'; principal: string; roleId: number; areaId: number; validUntil: string | null; comment: string; createdAt: string; createdBy: string | null }
+const inDays = (d: number) => new Date(Date.now() + d * 86400_000).toISOString();
+export const assignmentsSeed: DemoAssignment[] = [
+  { id: 1, principalType: 'user', principal: 'ivanov', roleId: 2, areaId: 3, validUntil: null, comment: 'приказ № 112 от 01.09', createdAt: now, createdBy: 'admin' },
+  { id: 2, principalType: 'user', principal: 'ivanov', roleId: 1, areaId: 2, validUntil: null, comment: 'видит соседние КНС', createdAt: now, createdBy: 'admin' },
+  { id: 3, principalType: 'user', principal: 'sidorov', roleId: 3, areaId: 2, validUntil: null, comment: '', createdAt: now, createdBy: 'admin' },
+  { id: 4, principalType: 'user', principal: 'petrova', roleId: 5, areaId: 2, validUntil: null, comment: '', createdAt: now, createdBy: 'admin' },
+  { id: 5, principalType: 'user', principal: 'pnr.kuznetsov', roleId: 4, areaId: 4, validUntil: inDays(14), comment: 'договор ПНР № 45/26', createdAt: now, createdBy: 'admin' },
+  { id: 6, principalType: 'user', principal: 'admin', roleId: 6, areaId: 1, validUntil: null, comment: '', createdAt: now, createdBy: 'system' },
+  { id: 7, principalType: 'user', principal: 'dispatcher', roleId: 1, areaId: 1, validUntil: null, comment: '', createdAt: now, createdBy: 'admin' },
+  { id: 8, principalType: 'user', principal: 'avar.operator', roleId: 2, areaId: 2, validUntil: null, comment: 'на случай недоступности домена', createdAt: now, createdBy: 'admin' },
+  { id: 9, principalType: 'group', principal: 'SCADA-Operators-KNS', roleId: 2, areaId: 2, validUntil: null, comment: '', createdAt: now, createdBy: 'admin' },
+  { id: 11, principalType: 'user', principal: 'smirnova', roleId: 3, areaId: 2, validUntil: null, comment: 'смена Б', createdAt: now, createdBy: 'admin' },
+  { id: 10, principalType: 'group', principal: 'SCADA-Engineers', roleId: 5, areaId: 1, validUntil: null, comment: '', createdAt: now, createdBy: 'admin' },
+];
+
+/** Персоны панели прототипа. */
+export type Persona = 'viewer' | 'operator' | 'senior' | 'commissioner' | 'engineer' | 'security';
+export const personas: { key: Persona; login: string; label: string; hint: string }[] = [
+  { key: 'viewer', login: 'dispatcher', label: 'Наблюдатель', hint: 'вся установка, только просмотр' },
+  { key: 'operator', login: 'ivanov', label: 'Оператор', hint: 'управляет КНС-1, видит Водоотведение' },
+  { key: 'senior', login: 'sidorov', label: 'Ст. оператор', hint: 'Водоотведение, критичные команды, снятие с контроля' },
+  { key: 'commissioner', login: 'pnr.kuznetsov', label: 'Наладчик', hint: 'готовит изменения КНС-2, не публикует, доступ на 14 дней' },
+  { key: 'engineer', login: 'petrova', label: 'Инженер', hint: 'конфигурация и публикация Водоотведения' },
+  { key: 'security', login: 'admin', label: 'Адм. ИБ', hint: 'пользователи, роли, назначения; не управляет' },
+];
 
 // ------------------------------------------------------------------ схемы
 
@@ -94,6 +145,7 @@ function kns1(): MnemoDoc {
     el('value', 1048, 109, 90, 28, { tag: 'KNS1_Auto', decimals: '', showUnit: false, fontSize: 13, label: 'Авт.' }),
     el('button', 1148, 107, 120, 32, { label: 'Авто ⇄ Ручной', tag: 'KNS1_Auto', mode: 'toggle', value: 1, fill: '#e0e7ff' }),
     el('link', 1400, 30, 170, 34, { label: '← Обзор', target: 3 }),
+    el('button', 900, 162, 210, 32, { label: 'Деблокировка защиты Н-1', tag: 'KNS1_P1_Unblock', mode: 'set', value: 1, fill: '#fee2e2' }),
     el('lamp', 1460, 110, 26, 26, { tag: 'KNS1_P2_Run', onColor: '#16a34a', offColor: '#94a3b8', invert: true, label: 'Н-2 стоп' }),
   );
   // последняя лампа — заготовка для задания №8, по умолчанию её нет
@@ -142,12 +194,12 @@ function overview(): MnemoDoc {
   return doc;
 }
 
-export interface MnemoSeed { id: number; name: string; parentId: number | null; sortOrder: number; doc: MnemoDoc }
+export interface MnemoSeed { id: number; name: string; parentId: number | null; sortOrder: number; areaId: number; doc: MnemoDoc }
 
 export function mnemosSeed(): MnemoSeed[] {
   return [
-    { id: 3, name: 'Обзор', parentId: null, sortOrder: 0, doc: overview() },
-    { id: 1, name: 'КНС-1', parentId: 3, sortOrder: 1, doc: kns1() },
-    { id: 2, name: 'КНС-2', parentId: 3, sortOrder: 2, doc: kns2() },
+    { id: 3, name: 'Обзор', parentId: null, sortOrder: 0, areaId: 2, doc: overview() },
+    { id: 1, name: 'КНС-1', parentId: 3, sortOrder: 1, areaId: 3, doc: kns1() },
+    { id: 2, name: 'КНС-2', parentId: 3, sortOrder: 2, areaId: 4, doc: kns2() },
   ];
 }

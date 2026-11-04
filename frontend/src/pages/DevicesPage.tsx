@@ -1,8 +1,8 @@
 import { useState } from 'react';
-import { Badge, Empty, Field, Modal, NumberInput, askConfirm } from '../components/ui';
+import { AreaSelect, Badge, Empty, Field, Modal, NumberInput, askConfirm } from '../components/ui';
 import { api, errorText } from '../lib/api';
 import { formatNumber, formatTime } from '../lib/format';
-import { toast, useCan, useMeta } from '../lib/stores';
+import { areaPath, toast, useAreas, useAuth, hasPerm, useCan, useMeta } from '../lib/stores';
 import type { Device, Protocol } from '../lib/types';
 
 const PROTOCOLS: { value: Protocol; label: string; endpoint: string; settings: string }[] = [
@@ -18,7 +18,9 @@ export function DevicesPage() {
   const devices = useMeta((s) => s.devices);
   const tags = useMeta((s) => s.tags);
   const reload = useMeta((s) => s.reloadDevices);
-  const can = useCan('engineer');
+  const can = useCan('config.edit');
+  const me = useAuth((s) => s.me);
+  useAreas((s) => s.byId);
   const [edit, setEdit] = useState<Partial<Device> | null>(null);
 
   const remove = async (d: Device) => {
@@ -33,17 +35,19 @@ export function DevicesPage() {
         <h3>Устройства и каналы связи</h3>
         <span className="grow" />
         <button className="primary" disabled={!can}
-          onClick={() => setEdit({ name: '', protocol: 'modbus_tcp', endpoint: PROTOCOLS[1].endpoint, settings: JSON.parse(PROTOCOLS[1].settings), enabled: true, pollMs: 1000, timeoutMs: 2000, description: '' })}>
+          onClick={() => setEdit({ name: '', protocol: 'modbus_tcp', endpoint: PROTOCOLS[1].endpoint, settings: JSON.parse(PROTOCOLS[1].settings), enabled: true, pollMs: 1000, timeoutMs: 2000, description: '',
+            areaId: (me?.permissions['config.edit'] === 'all' ? 1 : (me?.permissions['config.edit'] as number[] | undefined)?.[0]) ?? 1 })}>
           Добавить
         </button>
       </div>
       {devices.length === 0 ? <Empty>Устройств нет</Empty> : (
         <table className="table">
-          <thead><tr><th>Имя</th><th>Протокол</th><th>Адрес</th><th>Опрос, мс</th><th>Тегов</th><th>Состояние</th><th>Последний обмен</th><th>Задержка</th><th>Ошибки</th><th /></tr></thead>
+          <thead><tr><th>Имя</th><th>Область</th><th>Протокол</th><th>Адрес</th><th>Опрос, мс</th><th>Тегов</th><th>Состояние</th><th>Последний обмен</th><th>Задержка</th><th>Ошибки</th><th /></tr></thead>
           <tbody>
             {devices.map((d) => (
               <tr key={d.id} className={d.enabled ? '' : 'row-disabled'}>
                 <td><b>{d.name}</b><div className="muted small">{d.description}</div></td>
+                <td className="small">{areaPath(d.areaId)}</td>
                 <td>{PROTOCOLS.find((p) => p.value === d.protocol)?.label}</td>
                 <td className="mono">{d.endpoint}</td>
                 <td>{d.pollMs}</td>
@@ -56,8 +60,8 @@ export function DevicesPage() {
                 <td>{d.avgLatencyMs !== null && d.avgLatencyMs !== undefined ? `${formatNumber(d.avgLatencyMs, 1)} мс` : ''}</td>
                 <td>{d.errorCount ?? ''}</td>
                 <td className="actions">
-                  <button disabled={!can} onClick={() => setEdit(d)}>Изменить</button>
-                  <button disabled={!can} onClick={() => void remove(d)}>Удалить</button>
+                  <button disabled={!hasPerm(me, 'config.edit', d.areaId)} onClick={() => setEdit(d)}>Изменить</button>
+                  <button disabled={!hasPerm(me, 'config.edit', d.areaId)} onClick={() => void remove(d)}>Удалить</button>
                 </td>
               </tr>
             ))}
@@ -108,6 +112,9 @@ function DeviceForm({ device, onClose, onSaved }: { device: Partial<Device>; onC
         <Field label="Период опроса, мс"><NumberInput value={d.pollMs} onChange={(v) => set('pollMs', v ?? 1000)} /></Field>
         <Field label="Тайм-аут, мс"><NumberInput value={d.timeoutMs} onChange={(v) => set('timeoutMs', v ?? 2000)} /></Field>
         <Field label="Включено"><input type="checkbox" checked={!!d.enabled} onChange={(e) => set('enabled', e.target.checked)} /></Field>
+        <Field label="Область" hint="теги без своей области наследуют область устройства">
+          <AreaSelect value={d.areaId} perm="config.edit" onChange={(v) => set('areaId', v ?? 1)} />
+        </Field>
         <Field label="Описание" wide><input value={d.description ?? ''} onChange={(e) => set('description', e.target.value)} /></Field>
         <Field label="Параметры протокола (JSON)" wide hint={proto ? `шаблон: ${proto.settings}` : undefined}>
           <textarea rows={5} className="mono" value={settings} onChange={(e) => setSettings(e.target.value)} />

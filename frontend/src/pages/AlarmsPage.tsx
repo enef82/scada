@@ -4,7 +4,7 @@ import { api, errorText, qs } from '../lib/api';
 import { useAlarms } from '../lib/alarms';
 import { formatNumber, formatTime, priorityNames, toLocalInput } from '../lib/format';
 import { useRealtimeEvent } from '../lib/realtime';
-import { toast, useCan } from '../lib/stores';
+import { toast, usePerms , useMeta} from '../lib/stores';
 import type { ActiveAlarm, AlarmEvent } from '../lib/types';
 
 function stateText(a: ActiveAlarm): string {
@@ -31,7 +31,12 @@ export function AlarmsPage() {
 function ActiveAlarms() {
   const active = useAlarms((s) => s.active);
   const reload = useAlarms((s) => s.reload);
-  const can = useCan('operator');
+  const perms = usePerms();
+  const tagById = useMeta((s) => s.tagById);
+  // квитирование и снятие с контроля — по области тревоги (= области тега)
+  const can = (perm: 'alarm.ack' | 'alarm.shelve', a: { tagId: number }) => perms(perm, tagById.get(a.tagId)?.effectiveAreaId ?? 0);
+  const canAll = (perm: 'alarm.ack' | 'alarm.shelve', ids: number[]) =>
+    ids.length > 0 && ids.every((id) => { const a = active.find((x) => x.id === id); return !!a && can(perm, a); });
   const [sel, setSel] = useState<Set<number>>(new Set());
   const [shelve, setShelve] = useState<number[] | null>(null);
 
@@ -47,18 +52,18 @@ function ActiveAlarms() {
     }
   };
 
-  const unackedIds = active.filter((a) => !a.acked).map((a) => a.id);
+  const unackedIds = active.filter((a) => !a.acked && can('alarm.ack', a)).map((a) => a.id);
   const toggle = (id: number) => setSel((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
   return (
     <>
       <div className="toolbar">
-        <button className="primary" disabled={!can || !unackedIds.length} onClick={() => void act('/api/alarms/ack', unackedIds)}>
+        <button className="primary" disabled={!unackedIds.length} onClick={() => void act('/api/alarms/ack', unackedIds)}>
           Квитировать все ({unackedIds.length})
         </button>
-        <button disabled={!can || !sel.size} onClick={() => void act('/api/alarms/ack', [...sel])}>Квитировать выбранные</button>
-        <button disabled={!can || !sel.size} onClick={() => setShelve([...sel])}>Снять с контроля…</button>
-        <button disabled={!can || !sel.size} onClick={() => void act('/api/alarms/unshelve', [...sel])}>Вернуть на контроль</button>
+        <button disabled={!canAll('alarm.ack', [...sel])} onClick={() => void act('/api/alarms/ack', [...sel])}>Квитировать выбранные</button>
+        <button disabled={!canAll('alarm.shelve', [...sel])} title={perms('alarm.shelve') ? '' : 'Нужно право «Снятие с контроля» (старший оператор)'} onClick={() => setShelve([...sel])}>Снять с контроля…</button>
+        <button disabled={!canAll('alarm.shelve', [...sel])} onClick={() => void act('/api/alarms/unshelve', [...sel])}>Вернуть на контроль</button>
         <span className="grow" />
         <span className="muted">Всего: {active.length}</span>
       </div>
@@ -78,7 +83,7 @@ function ActiveAlarms() {
                 <td>{formatNumber(a.value)} {a.unit}</td>
                 <td>{stateText(a)}</td>
                 <td>{a.ackedBy ? `${a.ackedBy}, ${formatTime(a.ackedAt, false)}` : ''}</td>
-                <td>{!a.acked && <button disabled={!can} onClick={() => void act('/api/alarms/ack', [a.id])}>Квитировать</button>}</td>
+                <td>{!a.acked && <button disabled={!can('alarm.ack', a)} onClick={() => void act('/api/alarms/ack', [a.id])}>Квитировать</button>}</td>
               </tr>
             ))}
           </tbody>

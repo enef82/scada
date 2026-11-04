@@ -4,7 +4,7 @@ import { plural } from '../components/Layout';
 import { api, ApiError, errorText } from '../lib/api';
 import { formatTime } from '../lib/format';
 import { onRealtime, useRealtimeEvent } from '../lib/realtime';
-import { toast, useDraft, useMeta } from '../lib/stores';
+import { areaPath, toast, useCan, useDraft, useMeta } from '../lib/stores';
 import type { ChangeItem, ChangeSummary, ConfigVersion, DraftDiff, ObjectType, ValidationIssue } from '../lib/types';
 
 const TYPE_NAMES: Record<ObjectType, [string, string, string]> = {
@@ -32,7 +32,7 @@ const FIELD: Record<string, string> = {
   writeMax: 'макс. записи', writeConfirm: 'подтверждение', enabled: 'включён', protocol: 'протокол', endpoint: 'адрес устройства',
   settingsJson: 'параметры протокола', timeoutMs: 'тайм-аут, мс', tagId: 'тег', kind: 'тип тревоги', limit: 'уставка', limitValue: 'уставка', settings: 'параметры протокола',
   hysteresis: 'гистерезис', delayMs: 'задержка, мс', priority: 'приоритет', message: 'сообщение', parentId: 'раздел',
-  sortOrder: 'порядок', version: 'содержимое',
+  sortOrder: 'порядок', version: 'содержимое', areaId: 'область', commandClass: 'класс команды',
 };
 
 /** «добавлено 12 тегов, изменён 1 тег, удалена 1 тревога» */
@@ -59,6 +59,8 @@ function useValueFormatter() {
     if (field === 'deviceId') return devices.find((d) => d.id === v)?.name ?? `#${v}`;
     if (field === 'tagId') return tagById.get(Number(v))?.name ?? `#${v}`;
     if (field === 'version') return `в.${v}`;
+    if (field === 'areaId') return areaPath(Number(v));
+    if (field === 'commandClass') return ({ normal: 'обычный', important: 'важный', critical: 'критичный' } as Record<string, string>)[String(v)] ?? String(v);
     return String(v);
   };
 }
@@ -100,6 +102,7 @@ function DraftTab() {
   const [discard, setDiscard] = useState(false);
   const fmt = useValueFormatter();
   const reloadStatus = useDraft((s) => s.reload);
+  const canPublish = useCan('config.publish');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -190,10 +193,11 @@ function DraftTab() {
               <table className="table">
                 <thead><tr><th style={{ width: 110 }}>Действие</th><th style={{ width: 220 }}>Объект</th><th>Что изменилось</th><th style={{ width: 160 }}>Кто</th></tr></thead>
                 <tbody>
-                  {items.map(({ change: c, authors, lastAt }) => (
+                  {items.map(({ change: c, authors, lastAt, areas, canPublish }) => (
                     <tr key={`${c.objectType}-${c.id}`} className={c.highlight ? 'row-highlight' : ''}>
                       <td><Badge kind={OP[c.op].kind}>{opLabel(c)}</Badge></td>
-                      <td><b>{c.name}</b></td>
+                      <td><b>{c.name}</b>{areas && <div className="muted small">{areas.join(' → ')}</div>}
+                        {canPublish === false && <Badge kind="warn">нет права на публикацию</Badge>}</td>
                       <td>
                         {c.fields.length === 0 ? <span className="muted">{c.op === 'created' ? 'новый объект' : 'объект удаляется'}</span> : (
                           <div className="field-changes">
@@ -228,14 +232,15 @@ function DraftTab() {
               </label>
             )}
             <div className="row">
-              <button className="primary" disabled={busy || blocked || needAccept || !comment.trim() || !password} onClick={() => void publish()}>
+              <button className="primary" disabled={!canPublish || busy || blocked || needAccept || !comment.trim() || !password} onClick={() => void publish()}>
                 {busy ? 'Публикация…' : `Опубликовать версию ${diff.baseVersion + 1}`}
               </button>
               <button onClick={() => void load()} disabled={loading}>Проверить заново</button>
               <span className="grow" />
-              <button className="danger-outline" onClick={() => setDiscard(true)}>Сбросить черновик</button>
+              <button className="danger-outline" disabled={!canPublish} onClick={() => setDiscard(true)}>Сбросить черновик</button>
             </div>
             {blocked && <p className="small warn">Исправьте ошибки — кнопка станет доступна.</p>}
+            {!canPublish && <p className="small warn">У вас нет права «Публикация»: подготовленные правки публикует инженер.</p>}
           </div>
         </>
       )}
@@ -306,6 +311,7 @@ function HistoryTab() {
 }
 
 function VersionRow({ v, current, open, onToggle, onRollback }: { v: ConfigVersion; current: boolean; open: boolean; onToggle: () => void; onRollback: () => void }) {
+  const canPublish = useCan('config.publish');
   const [details, setDetails] = useState<ChangeItem[] | null>(null);
   const fmt = useValueFormatter();
   useEffect(() => {
@@ -322,7 +328,7 @@ function VersionRow({ v, current, open, onToggle, onRollback }: { v: ConfigVersi
         <td className="small">{v.appliedAt ? `${formatTime(v.appliedAt, false)}${v.appliedMs !== null ? `, ${(v.appliedMs / 1000).toFixed(1)} с` : ''}` : <span className="warn">нет подтверждения</span>}</td>
         <td className="actions">
           <button onClick={onToggle}>{open ? 'Скрыть' : 'Подробно'}</button>
-          {!current && <button onClick={onRollback}>Откатить к этой</button>}
+          {!current && canPublish && <button onClick={onRollback}>Откатить к этой</button>}
         </td>
       </tr>
       {open && (
