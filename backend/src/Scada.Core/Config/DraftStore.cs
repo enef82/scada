@@ -39,10 +39,10 @@ public static class DraftStore
             while (await r.ReadAsync(ct)) alarms.Add(ConfigRepository.ReadAlarm(r));
 
         var mnemos = new List<MnemoRef>();
-        await using (var cmd = Cmd("SELECT id, name, parent_id, sort_order, current_version FROM mnemos WHERE NOT deleted ORDER BY id", conn, tx))
+        await using (var cmd = Cmd("SELECT id, name, parent_id, sort_order, current_version, area_id FROM mnemos WHERE NOT deleted ORDER BY id", conn, tx))
         await using (var r = await cmd.ExecuteReaderAsync(ct))
             while (await r.ReadAsync(ct))
-                mnemos.Add(new MnemoRef(r.GetInt32(0), r.GetString(1), r.GetNullableInt(2), r.GetInt32(3), r.GetInt32(4)));
+                mnemos.Add(new MnemoRef(r.GetInt32(0), r.GetString(1), r.GetNullableInt(2), r.GetInt32(3), r.GetInt32(4), r.GetInt32(5)));
 
         return new ConfigSnapshot(devices, tags, alarms, mnemos);
     }
@@ -104,12 +104,12 @@ public static class DraftStore
 
         foreach (var d in s.Devices)
         {
-            object?[] args = [d.Id, d.Name, d.Protocol.ToCode(), d.Endpoint, d.SettingsJson, d.Enabled, d.PollMs, d.TimeoutMs, d.Description];
+            object?[] args = [d.Id, d.Name, d.Protocol.ToCode(), d.Endpoint, d.SettingsJson, d.Enabled, d.PollMs, d.TimeoutMs, d.Description, AreaOrRoot(d.AreaId)];
             await UpsertAsync(conn, tx,
                 "UPDATE devices SET name=$2, protocol=$3, endpoint=$4, settings=$5::jsonb, enabled=$6, poll_ms=$7, timeout_ms=$8, " +
-                "description=$9, deleted=false, row_version=row_version+1, updated_at=now() WHERE id=$1",
-                "INSERT INTO devices (id, name, protocol, endpoint, settings, enabled, poll_ms, timeout_ms, description) " +
-                "VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9)", args, ct);
+                "description=$9, area_id=$10, deleted=false, row_version=row_version+1, updated_at=now() WHERE id=$1",
+                "INSERT INTO devices (id, name, protocol, endpoint, settings, enabled, poll_ms, timeout_ms, description, area_id) " +
+                "VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10)", args, ct);
         }
         foreach (var t in s.Tags)
         {
@@ -118,15 +118,16 @@ public static class DraftStore
                 t.Id, t.Name, t.Description, t.DeviceId, t.Address, t.DataType.ToCode(), t.Unit, t.RawLow, t.RawHigh, t.EngLow,
                 t.EngHigh, t.PollMs, t.StaleAfterMs, t.DeadbandUi, t.DeadbandArchive, ArchiveCode(t.ArchiveMode),
                 t.ArchiveIntervalS, t.Writable, t.WriteMin, t.WriteMax, t.WriteConfirm, t.Enabled,
+                t.AreaId is > 0 ? t.AreaId : null, t.CommandClass.ToCode(),
             ];
             await UpsertAsync(conn, tx,
                 "UPDATE tags SET name=$2, description=$3, device_id=$4, address=$5, data_type=$6, unit=$7, raw_low=$8, raw_high=$9, " +
                 "eng_low=$10, eng_high=$11, poll_ms=$12, stale_after_ms=$13, deadband_ui=$14, deadband_archive=$15, archive_mode=$16, " +
                 "archive_interval_s=$17, writable=$18, write_min=$19, write_max=$20, write_confirm=$21, enabled=$22, " +
-                "deleted=false, row_version=row_version+1, updated_at=now() WHERE id=$1",
+                "area_id=$23, command_class=$24, deleted=false, row_version=row_version+1, updated_at=now() WHERE id=$1",
                 "INSERT INTO tags (id, name, description, device_id, address, data_type, unit, raw_low, raw_high, eng_low, eng_high, " +
                 "poll_ms, stale_after_ms, deadband_ui, deadband_archive, archive_mode, archive_interval_s, writable, write_min, " +
-                "write_max, write_confirm, enabled) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)",
+                "write_max, write_confirm, enabled, area_id, command_class) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)",
                 args, ct);
         }
         foreach (var a in s.Alarms)
@@ -140,11 +141,11 @@ public static class DraftStore
         }
         foreach (var m in s.Mnemos)
         {
-            object?[] args = [m.Id, m.Name, m.ParentId, m.SortOrder, m.Version];
+            object?[] args = [m.Id, m.Name, m.ParentId, m.SortOrder, m.Version, AreaOrRoot(m.AreaId)];
             await UpsertAsync(conn, tx,
-                "UPDATE mnemos SET name=$2, parent_id=$3, sort_order=$4, current_version=$5, deleted=false, " +
+                "UPDATE mnemos SET name=$2, parent_id=$3, sort_order=$4, current_version=$5, area_id=$6, deleted=false, " +
                 "row_version=row_version+1, updated_at=now() WHERE id=$1",
-                "INSERT INTO mnemos (id, name, parent_id, sort_order, current_version) VALUES ($1,$2,$3,$4,$5)", args, ct);
+                "INSERT INTO mnemos (id, name, parent_id, sort_order, current_version, area_id) VALUES ($1,$2,$3,$4,$5,$6)", args, ct);
         }
         await using (var clear = Cmd("DELETE FROM draft_changes", conn, tx)) await clear.ExecuteNonQueryAsync(ct);
     }
@@ -167,6 +168,8 @@ public static class DraftStore
         await using var ins = Cmd(insert, conn, tx, args);
         await ins.ExecuteNonQueryAsync(ct);
     }
+
+    private static int AreaOrRoot(int areaId) => areaId > 0 ? areaId : 1;
 
     public static string ArchiveCode(ArchiveMode m) => m switch
     {

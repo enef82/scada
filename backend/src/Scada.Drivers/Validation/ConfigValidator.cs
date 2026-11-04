@@ -19,6 +19,8 @@ public sealed class ValidationOptions
     public long ArchiveRowsPerDayLimit { get; set; } = 100_000_000;
     /// <summary>Сколько однотипных сообщений выводить, остальные сворачиваются в одно.</summary>
     public int MaxPerCode { get; set; } = 30;
+    /// <summary>Существующие области; null — не проверять принадлежность.</summary>
+    public IReadOnlySet<int>? KnownAreas { get; set; }
 }
 
 /// <summary>
@@ -35,6 +37,11 @@ public static partial class ConfigValidator
 
     [GeneratedRegex(@"^(sine|ramp|square|random|memory|follow)(:.*)?$", RegexOptions.IgnoreCase)]
     private static partial Regex SimAddress();
+
+    public static string ClassName(CommandClass c) => c switch
+    {
+        CommandClass.Important => "Важный", CommandClass.Critical => "Критичный", _ => "Обычный",
+    };
 
     public static List<ValidationIssue> Validate(
         ConfigSnapshot next, ConfigSnapshot? prev, IReadOnlyDictionary<int, JsonElement> mnemoDocs, ValidationOptions? options = null)
@@ -75,6 +82,18 @@ public static partial class ConfigValidator
                 Add("became-writable", ValidationIssue.Warning, $"Тег {t.Name}: разрешена запись из SCADA", "tag", t.Id);
             if (t.Writable && !t.WriteConfirm && (old is null || old.WriteConfirm || !old.Writable))
                 Add("confirm-removed", ValidationIssue.Warning, $"Тег {t.Name}: команды выполняются без подтверждения оператора", "tag", t.Id);
+            if (t.Writable && old is { Writable: true } && t.CommandClass < old.CommandClass)
+                Add("class-lowered", ValidationIssue.Warning,
+                    $"Тег {t.Name}: класс команды понижен «{ClassName(old.CommandClass)}» → «{ClassName(t.CommandClass)}» — подтверждение станет проще", "tag", t.Id);
+            if (opt.KnownAreas is { } areas && t.AreaId is > 0 and var ta && !areas.Contains(ta))
+                Add("area-missing", ValidationIssue.Error, $"Тег {t.Name}: область #{ta} не существует", "tag", t.Id);
+        }
+        if (opt.KnownAreas is { } known)
+        {
+            foreach (var d in next.Devices.Where(d => !known.Contains(d.AreaId)))
+                Add("area-missing", ValidationIssue.Error, $"Устройство «{d.Name}»: область #{d.AreaId} не существует", "device", d.Id);
+            foreach (var m in next.Mnemos.Where(m => !known.Contains(m.AreaId)))
+                Add("area-missing", ValidationIssue.Error, $"Схема «{m.Name}»: область #{m.AreaId} не существует", "mnemo", m.Id);
         }
 
         // ---- пересечение адресов Modbus

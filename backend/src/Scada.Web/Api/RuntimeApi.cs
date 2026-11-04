@@ -2,7 +2,9 @@ using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Npgsql;
+using Scada.Core.Access;
 using Scada.Core.Data;
+using Scada.Core.Model;
 using Scada.Core.Notify;
 using Scada.Web.Infrastructure;
 using Scada.Web.Realtime;
@@ -17,9 +19,20 @@ public sealed class CommandOptions
     public int WaitSeconds { get; set; } = 20;
     /// <summary>Служба сбора считается недоступной, если нет heartbeat дольше этого.</summary>
     public int AcquisitionStaleSeconds { get; set; } = 20;
+    /// <summary>Сколько критичная команда ждёт второго подтверждающего.</summary>
+    public int ConfirmSeconds { get; set; } = 60;
+    /// <summary>
+    /// second_user — второй пользователь с правом «Критичные команды» с другого сеанса;
+    /// permit — объект с одним дежурным: повторный пароль и номер наряда (решение заказчика).
+    /// </summary>
+    public string CriticalConfirmMode { get; set; } = "second_user";
 }
 
-public sealed record CommandRequest(int TagId, double? Value, string? ValueStr, bool Confirmed);
+public sealed record CommandRequest(int TagId, double? Value, string? ValueStr, bool Confirmed,
+    string? Password = null, string? Comment = null, string? PermitCode = null);
+public sealed record CommandConfirmRequest(string? Password, bool Approve = true, string? Comment = null);
+public sealed record AwaitingCommandDto(long Id, int TagId, string TagName, string TagDescription, string Unit, double? ValueNum,
+    string? ValueStr, double? CurrentValue, string RequestedBy, DateTime RequestedAt, DateTime ExpiresAt, string? Comment, string AreaPath);
 public sealed record AlarmActionRequest(int[] Ids, string? Comment, int? Minutes);
 
 public sealed record ActiveAlarmDto(
@@ -33,24 +46,27 @@ public sealed record AlarmEventDto(
 
 public sealed record CommandDto(
     long Id, int TagId, string TagName, double? ValueNum, string? ValueStr, string RequestedBy, DateTime RequestedAt,
-    DateTime ExpiresAt, string Status, string? Result, double? ReadbackNum, DateTime? FinishedAt);
+    DateTime ExpiresAt, string Status, string? Result, double? ReadbackNum, DateTime? FinishedAt,
+    string CommandClass = "normal", string? Comment = null, string? ConfirmedBy = null);
 
 public static class RuntimeApi
 {
     public static void Map(RouteGroupBuilder api)
     {
         // ------------------------------------------------------------ текущие значения
-        api.MapGet("/values", (string? ids, RealtimeService rt) =>
+        api.MapGet("/values", async (string? ids, HttpContext http, RealtimeService rt, AccessService access, CancellationToken ct) =>
         {
-            var list = ParseIds(ids);
-            return Results.Ok(rt.Snapshot(list));
-        }).RequireAuthorization(Roles.CanView);
+            var runtime = await access.RuntimeAsync(ct);
+            var perms = await http.PermsAsync();
+            var list = ids is null ? runtime.Tags.Keys : ParseIds(ids);
+            return Results.Ok(rt.Snapshot(runtime.Allowed(perms, list)));
+        }).RequireAuthorization(View);
 
         // ------------------------------------------------------------ архив / тренды
         api.MapGet("/history", async (string tagIds, DateTimeOffset from, DateTimeOffset to, int? points,
-            NpgsqlDataSource ds, CancellationToken ct) =>
+            HttpContext http, NpgsqlDataSource ds, AccessService access, CancellationToken ct) =>
         {
-            var ids = ParseIds(tagIds);
+            var ids = (await access.RuntimeAsync(ct)).Allowed(await http.PermsAsync(), ParseIds(tagIds));
             if (ids.Length == 0 || ids.Length > 16) return Results.Problem("Укажите от 1 до 16 тегов", statusCode: 400);
             if (to <= from) return Results.Problem("Неверный интервал", statusCode: 400);
             var span = to - from;
@@ -88,11 +104,12 @@ public static class RuntimeApi
             foreach (var (id, ts, avg, min, max, q) in agg)
                 result[id].Add([Ms(ts), avg, min, max, q]);
             return Results.Ok(new { mode = "aggregate", bucketSeconds = bucket, series = result });
-        }).RequireAuthorization(Roles.CanView);
+        }).RequireAuthorization(View);
 
         api.MapGet("/history/export", async (int tagId, DateTimeOffset from, DateTimeOffset to, NpgsqlDataSource ds,
-            HttpContext http, Audit audit, CancellationToken ct) =>
+            HttpContext http, AccessService access, Audit audit, CancellationToken ct) =>
         {
+            if (await http.DenyUnlessAsync(Perm.View, (await access.RuntimeAsync(ct)).TagArea(tagId), $"history:{tagId}") is { } denied) return denied;
             var rows = await ds.QueryAsync(
                 "SELECT ts, num, str, quality FROM tag_history WHERE tag_id = $1 AND ts >= $2 AND ts <= $3 ORDER BY ts LIMIT 1000000",
                 r => string.Join(';',
@@ -104,10 +121,10 @@ public static class RuntimeApi
             await audit.WriteAsync(http, "export", $"history:{tagId}", new { from, to, rows = rows.Count });
             var csv = "ts_utc;num;str;quality\n" + string.Join("\n", rows) + "\n";
             return Results.File(System.Text.Encoding.UTF8.GetBytes(csv), "text/csv; charset=utf-8", $"history_{tagId}.csv");
-        }).RequireAuthorization(Roles.CanView);
+        }).RequireAuthorization(View);
 
         // ------------------------------------------------------------ тревоги
-        api.MapGet("/alarms/active", async (NpgsqlDataSource ds, CancellationToken ct) =>
+        api.MapGet("/alarms/active", async (HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
             await ds.QueryAsync(
                 """
                 SELECT a.alarm_def_id, d.tag_id, t.name, t.description, t.unit, d.kind, d.priority, d.message,
@@ -115,18 +132,20 @@ public static class RuntimeApi
                 FROM alarm_active a
                 JOIN alarm_defs d ON d.id = a.alarm_def_id
                 JOIN tags t ON t.id = d.tag_id
-                WHERE a.active OR NOT a.acked OR a.shelved_until > now()
+                JOIN devices dv ON dv.id = t.device_id
+                WHERE (a.active OR NOT a.acked OR a.shelved_until > now())
+                  AND ($1::int[] IS NULL OR coalesce(t.area_id, dv.area_id) = ANY($1))
                 ORDER BY (a.active AND NOT a.acked) DESC, d.priority, a.raised_at DESC
                 """,
                 r => new ActiveAlarmDto(r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetString(3), r.GetString(4),
                     r.GetString(5), r.GetInt16(6), r.GetString(7), r.GetBoolean(8), r.GetBoolean(9),
                     r.GetNullableDouble(10), r.GetNullableDateTime(11), r.GetNullableDateTime(12),
                     r.GetNullableDateTime(13), r.GetNullableString(14), r.GetNullableDateTime(15),
-                    r.GetNullableString(16)), ct))
-            .RequireAuthorization(Roles.CanView);
+                    r.GetNullableString(16)), ct, (await http.PermsAsync()).AreasOrAll(Perm.View)))
+            .RequireAuthorization(View);
 
         api.MapGet("/alarms/events", async (DateTimeOffset? from, DateTimeOffset? to, int? limit,
-            NpgsqlDataSource ds, CancellationToken ct) =>
+            HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
             await ds.QueryAsync(
                 """
                 SELECT e.id, e.ts, e.alarm_def_id, e.event, e.value, e.user_login, e.comment,
@@ -134,95 +153,236 @@ public static class RuntimeApi
                 FROM alarm_events e
                 LEFT JOIN alarm_defs d ON d.id = e.alarm_def_id
                 LEFT JOIN tags t ON t.id = d.tag_id
-                WHERE e.ts >= $1 AND e.ts <= $2
+                LEFT JOIN devices dv ON dv.id = t.device_id
+                WHERE e.ts >= $1 AND e.ts <= $2 AND ($4::int[] IS NULL OR coalesce(t.area_id, dv.area_id) = ANY($4))
                 ORDER BY e.ts DESC LIMIT $3
                 """,
                 r => new AlarmEventDto(r.GetInt64(0), r.GetUtc(1), r.GetInt32(2), r.GetString(3), r.GetNullableDouble(4),
                     r.GetNullableString(5), r.GetNullableString(6), r.GetString(7), r.GetString(8), r.GetInt16(9)), ct,
                 (from ?? DateTimeOffset.UtcNow.AddDays(-1)).UtcDateTime, (to ?? DateTimeOffset.UtcNow).UtcDateTime,
-                Math.Clamp(limit ?? 500, 1, 5000)))
-            .RequireAuthorization(Roles.CanView);
+                Math.Clamp(limit ?? 500, 1, 5000), (await http.PermsAsync()).AreasOrAll(Perm.View)))
+            .RequireAuthorization(View);
 
         api.MapPost("/alarms/ack", (AlarmActionRequest req, HttpContext http, NpgsqlDataSource ds, RealtimeService rt,
             IOptions<CommandOptions> opt, Audit audit, CancellationToken ct) =>
-            SendAlarmAction(req, "ack", http, ds, rt, opt.Value, audit, ct))
-            .RequireAuthorization(Roles.CanOperate);
+            SendAlarmAction(req, "ack", Perm.AlarmAck, http, ds, rt, opt.Value, audit, ct))
+            .RequireAuthorization(Policies.Of(Perm.AlarmAck));
 
         api.MapPost("/alarms/shelve", (AlarmActionRequest req, HttpContext http, NpgsqlDataSource ds, RealtimeService rt,
             IOptions<CommandOptions> opt, Audit audit, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.Comment))
                 return Task.FromResult(Results.Problem("Для снятия с контроля обязателен комментарий", statusCode: 400));
-            return SendAlarmAction(req, "shelve", http, ds, rt, opt.Value, audit, ct);
-        }).RequireAuthorization(Roles.CanOperate);
+            return SendAlarmAction(req, "shelve", Perm.AlarmShelve, http, ds, rt, opt.Value, audit, ct);
+        }).RequireAuthorization(Policies.Of(Perm.AlarmShelve));
 
         api.MapPost("/alarms/unshelve", (AlarmActionRequest req, HttpContext http, NpgsqlDataSource ds, RealtimeService rt,
             IOptions<CommandOptions> opt, Audit audit, CancellationToken ct) =>
-            SendAlarmAction(req, "unshelve", http, ds, rt, opt.Value, audit, ct))
-            .RequireAuthorization(Roles.CanOperate);
+            SendAlarmAction(req, "unshelve", Perm.AlarmShelve, http, ds, rt, opt.Value, audit, ct))
+            .RequireAuthorization(Policies.Of(Perm.AlarmShelve));
 
         // ------------------------------------------------------------ команды
+        // Класс критичности тега задаёт право и способ подтверждения:
+        //   обычный — диалог; важный — + пароль и комментарий; критичный — + второй пользователь за ConfirmSeconds.
         api.MapPost("/commands", async (CommandRequest req, HttpContext http, NpgsqlDataSource ds, RealtimeService rt,
-            CommandWaiter waiter, IOptions<CommandOptions> opt, Audit audit, CancellationToken ct) =>
+            CommandWaiter waiter, AccessService access, Credentials credentials, IDirectory directory,
+            IOptions<CommandOptions> opt, Audit audit, CancellationToken ct) =>
         {
             var o = opt.Value;
-            var tag = await ds.QuerySingleAsync(
-                "SELECT name, data_type, writable, write_min, write_max, write_confirm, enabled FROM tags WHERE id = $1",
-                r => (Name: r.GetString(0), Type: r.GetString(1), Writable: r.GetBoolean(2), Min: r.GetNullableDouble(3),
-                      Max: r.GetNullableDouble(4), Confirm: r.GetBoolean(5), Enabled: r.GetBoolean(6)), ct, req.TagId);
-
-            // предварительные проверки (окончательные — в службе сбора)
-            if (tag.Name is null) return Results.NotFound();
+            var runtime = await access.RuntimeAsync(ct);
+            // свойства тега — из опубликованной версии, по которой работает служба сбора
+            if (!runtime.Tags.TryGetValue(req.TagId, out var tag)) return Results.NotFound();
+            var area = runtime.TagArea(tag.Id);
+            var cls = tag.CommandClass;
+            var perm = AccessCalculator.CommandPermission(cls, tag.DataType == TagDataType.Bool);
             if (!tag.Enabled || !tag.Writable) return Results.Problem("Тег недоступен для записи", statusCode: 403);
-            if (tag.Confirm && !req.Confirmed) return Results.Problem("Требуется подтверждение оператора", statusCode: 428);
-            if (tag.Type == "string" ? req.ValueStr is null : req.Value is null)
+
+            var perms = await http.PermsAsync();
+            if (cls != CommandClass.Normal && http.User.IsDomain())
+            {
+                // перед важной и критичной командой группы AD проверяются заново
+                var fresh = await directory.LookupAsync(http.User.Login(), ct);
+                if (fresh.Status == DirectoryStatus.Ok) perms = await access.ForAsync(http.User.Login(), fresh.User!.Groups, ct);
+                else if (fresh.Status != DirectoryStatus.Unavailable)
+                    return Results.Problem("Учётная запись отключена или удалена в домене", statusCode: 403);
+            }
+            var model = await access.ModelAsync(ct);
+            if (!perms.Has(perm, area))
+            {
+                await audit.WriteAsync(http, "access_denied", $"tag:{tag.Id}", new { perm, area = model.Tree.Path(area), tag = tag.Name, commandClass = cls.ToCode() });
+                return Results.Problem($"Нет права «{Perm.Names[perm]}» на область «{model.Tree.Path(area)}»", statusCode: 403);
+            }
+
+            if ((cls == CommandClass.Normal && tag.WriteConfirm || cls != CommandClass.Normal) && !req.Confirmed)
+                return Results.Problem("Требуется подтверждение оператора", statusCode: 428);
+            if (cls != CommandClass.Normal)
+            {
+                if (string.IsNullOrWhiteSpace(req.Comment)) return Results.Problem("Для этой команды обязателен комментарий", statusCode: 400);
+                if (!await credentials.VerifyAsync(http.User.Login(), req.Password, ct))
+                {
+                    await audit.WriteAsync(http, "command_denied", $"tag:{tag.Id}", new { reason = "password", tag = tag.Name });
+                    return Results.Problem("Неверный пароль", statusCode: 403);
+                }
+            }
+            var permit = cls == CommandClass.Critical && o.CriticalConfirmMode == "permit";
+            if (permit && string.IsNullOrWhiteSpace(req.PermitCode))
+                return Results.Problem("Укажите номер наряда-допуска", statusCode: 400);
+            if (tag.DataType == TagDataType.String ? req.ValueStr is null : req.Value is null)
                 return Results.Problem("Не задано значение", statusCode: 400);
-            if (req.Value is { } v && (v < tag.Min || v > tag.Max))
-                return Results.Problem($"Значение вне диапазона [{tag.Min}; {tag.Max}]", statusCode: 400);
+            if (req.Value is { } v && (v < tag.WriteMin || v > tag.WriteMax))
+                return Results.Problem($"Значение вне диапазона [{tag.WriteMin}; {tag.WriteMax}]", statusCode: 400);
             if (!AcquisitionAlive(rt, o))
                 return Results.Problem("Служба сбора недоступна — команда не отправлена", statusCode: 503);
 
+            var awaiting = cls == CommandClass.Critical && !permit;
             var id = Convert.ToInt64(await ds.ScalarAsync(
-                "INSERT INTO commands (tag_id, value_num, value_str, requested_by, expires_at, client_ip) " +
-                "VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6) RETURNING id", ct,
-                req.TagId, tag.Type == "string" ? null : req.Value, tag.Type == "string" ? req.ValueStr : null,
-                http.User.Login(), (double)o.TtlSeconds, http.Ip()));
+                "INSERT INTO commands (tag_id, value_num, value_str, requested_by, expires_at, client_ip, status, command_class, comment, " +
+                "requested_session, confirm_mode, permit_code) " +
+                "VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6, $7, $8, $9, $10, $11, $12) RETURNING id", ct,
+                req.TagId, tag.DataType == TagDataType.String ? null : req.Value, tag.DataType == TagDataType.String ? req.ValueStr : null,
+                http.User.Login(), (double)(awaiting ? o.ConfirmSeconds : o.TtlSeconds), http.Ip(),
+                awaiting ? "awaiting_confirm" : "pending", cls.ToCode(), req.Comment?.Trim(), http.User.SessionId(),
+                cls == CommandClass.Critical ? (permit ? "permit" : "second_user") : null, permit ? req.PermitCode!.Trim() : null));
 
-            var wait = waiter.Register(id);
-            // уведомление могло прийти раньше регистрации — проверяем таблицу
-            var (status, result) = await CommandStatusAsync(ds, id, ct);
-            if (status is "pending" or "executing")
+            var details = new
             {
-                var done = await Task.WhenAny(wait, Task.Delay(TimeSpan.FromSeconds(o.WaitSeconds), ct));
-                (status, result) = done == wait ? wait.Result : await CommandStatusAsync(ds, id, ct);
+                command = id, tag = tag.Name, value = req.Value, valueStr = req.ValueStr, commandClass = cls.ToCode(), comment = req.Comment,
+                confirmation = cls switch
+                {
+                    CommandClass.Normal => tag.WriteConfirm ? "dialog" : "none",
+                    CommandClass.Important => "password+comment",
+                    _ => permit ? "password+comment+permit" : "password+comment+second_user",
+                },
+                permitCode = permit ? req.PermitCode : null, via = perms.Via(perm, area, model.Tree),
+            };
+            if (awaiting)
+            {
+                await audit.WriteAsync(http, "command_requested", $"tag:{req.TagId}", details);
+                return Results.Json(new { id, status = "awaiting_confirm", confirmSeconds = o.ConfirmSeconds }, statusCode: 202);
             }
-            waiter.Forget(id);
 
-            await audit.WriteAsync(http, "command", $"tag:{req.TagId}", new
-            {
-                command = id, tag = tag.Name, value = req.Value, valueStr = req.ValueStr, status, result,
-            });
+            var (status, result) = await WaitAsync(ds, waiter, id, o, ct);
+            await audit.WriteAsync(http, "command", $"tag:{req.TagId}", new { details, status, result });
             return Results.Ok(new { id, status, result });
-        }).RequireAuthorization(Roles.CanOperate);
+        }).RequireAuthorization(Policies.Of(Perm.CmdControl, Perm.CmdSetpoint, Perm.CmdCritical));
 
-        api.MapGet("/commands", async (int? limit, NpgsqlDataSource ds, CancellationToken ct) =>
+        // запросы на второе подтверждение, которые может подтвердить текущий пользователь
+        api.MapGet("/commands/awaiting", async (HttpContext http, NpgsqlDataSource ds, AccessService access, RealtimeService rt,
+            CancellationToken ct) =>
+        {
+            var perms = await http.PermsAsync();
+            var runtime = await access.RuntimeAsync(ct);
+            var tree = (await access.ModelAsync(ct)).Tree;
+            var rows = await ds.QueryAsync(
+                "SELECT id, tag_id, value_num, value_str, requested_by, requested_at, expires_at, comment FROM commands " +
+                "WHERE status = 'awaiting_confirm' AND expires_at > now() AND lower(requested_by) <> lower($1) ORDER BY id",
+                r => (Id: r.GetInt64(0), Tag: r.GetInt32(1), Num: r.GetNullableDouble(2), Str: r.GetNullableString(3), By: r.GetString(4),
+                      At: r.GetUtc(5), Until: r.GetUtc(6), Comment: r.GetNullableString(7)), ct, http.User.Login());
+            return rows.Where(x => perms.Has(Perm.CmdCritical, runtime.TagArea(x.Tag)) && runtime.Tags.ContainsKey(x.Tag))
+                .Select(x =>
+                {
+                    var t = runtime.Tags[x.Tag];
+                    return new AwaitingCommandDto(x.Id, x.Tag, t.Name, t.Description, t.Unit, x.Num, x.Str,
+                        rt.TryGet(x.Tag, out var cur) ? cur.Num : null, x.By, x.At, x.Until, x.Comment, tree.Path(runtime.TagArea(x.Tag)));
+                });
+        }).RequireAuthorization(Policies.Of(Perm.CmdCritical));
+
+        api.MapPost("/commands/{id:long}/confirm", async (long id, CommandConfirmRequest req, HttpContext http, NpgsqlDataSource ds,
+            AccessService access, Credentials credentials, IOptions<CommandOptions> opt, Audit audit, CancellationToken ct) =>
+        {
+            var c = await ds.QuerySingleAsync(
+                "SELECT tag_id, requested_by, requested_session, status, expires_at > now(), value_num, value_str FROM commands WHERE id = $1",
+                r => (Tag: r.GetInt32(0), By: r.GetString(1), Session: r.GetNullableString(2), Status: r.GetString(3), Alive: r.GetBoolean(4),
+                      Num: r.GetNullableDouble(5), Str: r.GetNullableString(6)), ct, id);
+            if (c.By is null) return Results.NotFound();
+            if (c.Status != "awaiting_confirm" || !c.Alive) return Results.Problem("Команда уже не ожидает подтверждения (истёк срок или её подтвердили)", statusCode: 409);
+            if (string.Equals(c.By, http.User.Login(), StringComparison.OrdinalIgnoreCase) || c.Session == http.User.SessionId())
+                return Results.Problem("Подтверждать должен другой пользователь со своего рабочего места", statusCode: 403);
+            var runtime = await access.RuntimeAsync(ct);
+            if (await http.DenyUnlessAsync(Perm.CmdCritical, runtime.TagArea(c.Tag), $"command:{id}") is { } denied) return denied;
+            if (!await credentials.VerifyAsync(http.User.Login(), req.Password, ct))
+                return Results.Problem("Неверный пароль", statusCode: 403);
+
+            if (!req.Approve)
+            {
+                var n = await ds.ExecAsync(
+                    "UPDATE commands SET status='rejected', result=$2, finished_at=now() WHERE id=$1 AND status='awaiting_confirm'", ct,
+                    id, $"отклонена вторым пользователем {http.User.Login()}" + (string.IsNullOrWhiteSpace(req.Comment) ? "" : $": {req.Comment.Trim()}"));
+                await audit.WriteAsync(http, "command_confirm", $"command:{id}", new { approve = false, author = c.By, req.Comment });
+                return n == 0 ? Results.Conflict() : Results.NoContent();
+            }
+
+            // подтверждение и запуск — одной транзакцией; триггер БД ещё раз проверяет «другой пользователь, другой сеанс»
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var ins = new NpgsqlCommand(
+                "INSERT INTO command_confirmations (command_id, user_login, session_id, client_ip) VALUES ($1,$2,$3,$4)", conn, tx))
+            {
+                ins.Parameters.Add(Db.P(id)); ins.Parameters.Add(Db.P(http.User.Login()));
+                ins.Parameters.Add(Db.P(http.User.SessionId())); ins.Parameters.Add(Db.P(http.Ip()));
+                await ins.ExecuteNonQueryAsync(ct);
+            }
+            // срок жизни команды отсчитывается от второго подтверждения
+            await using (var upd = new NpgsqlCommand(
+                "UPDATE commands SET status='pending', confirmed_by=$2, expires_at = now() + make_interval(secs => $3) " +
+                "WHERE id=$1 AND status='awaiting_confirm' AND expires_at > now()", conn, tx))
+            {
+                upd.Parameters.Add(Db.P(id)); upd.Parameters.Add(Db.P(http.User.Login())); upd.Parameters.Add(Db.P((double)opt.Value.TtlSeconds));
+                if (await upd.ExecuteNonQueryAsync(ct) == 0) return Results.Problem("Срок подтверждения истёк", statusCode: 409);
+            }
+            await tx.CommitAsync(ct);
+            await audit.WriteAsync(http, "command_confirm", $"command:{id}", new { approve = true, author = c.By, tag = c.Tag, value = c.Num, valueStr = c.Str });
+            return Results.NoContent();
+        }).RequireAuthorization(Policies.Of(Perm.CmdCritical));
+
+        api.MapGet("/commands", async (int? limit, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
             await ds.QueryAsync(
                 """
                 SELECT c.id, c.tag_id, t.name, c.value_num, c.value_str, c.requested_by, c.requested_at, c.expires_at,
-                       c.status, c.result, c.readback_num, c.finished_at
-                FROM commands c JOIN tags t ON t.id = c.tag_id ORDER BY c.id DESC LIMIT $1
+                       c.status, c.result, c.readback_num, c.finished_at, c.command_class, c.comment, c.confirmed_by
+                FROM commands c JOIN tags t ON t.id = c.tag_id JOIN devices d ON d.id = t.device_id
+                WHERE ($2::int[] IS NULL OR coalesce(t.area_id, d.area_id) = ANY($2))
+                ORDER BY c.id DESC LIMIT $1
                 """,
                 r => new CommandDto(r.GetInt64(0), r.GetInt32(1), r.GetString(2), r.GetNullableDouble(3),
                     r.GetNullableString(4), r.GetString(5), r.GetUtc(6), r.GetUtc(7), r.GetString(8),
-                    r.GetNullableString(9), r.GetNullableDouble(10), r.GetNullableDateTime(11)), ct,
-                Math.Clamp(limit ?? 100, 1, 1000)))
-            .RequireAuthorization(Roles.CanView);
+                    r.GetNullableString(9), r.GetNullableDouble(10), r.GetNullableDateTime(11), r.GetString(12),
+                    r.GetNullableString(13), r.GetNullableString(14)), ct,
+                Math.Clamp(limit ?? 100, 1, 1000), (await http.PermsAsync()).AreasOrAll(Perm.View)))
+            .RequireAuthorization(View);
     }
 
-    private static async Task<IResult> SendAlarmAction(AlarmActionRequest req, string action, HttpContext http,
+    private static readonly string View = Policies.Of(Perm.View);
+
+    private static async Task<(string Status, string? Result)> WaitAsync(NpgsqlDataSource ds, CommandWaiter waiter, long id,
+        CommandOptions o, CancellationToken ct)
+    {
+        var wait = waiter.Register(id);
+        // уведомление могло прийти раньше регистрации — проверяем таблицу
+        var (status, result) = await CommandStatusAsync(ds, id, ct);
+        if (status is "pending" or "executing")
+        {
+            var done = await Task.WhenAny(wait, Task.Delay(TimeSpan.FromSeconds(o.WaitSeconds), ct));
+            (status, result) = done == wait ? wait.Result : await CommandStatusAsync(ds, id, ct);
+        }
+        waiter.Forget(id);
+        return (status, result);
+    }
+
+    private static async Task<IResult> SendAlarmAction(AlarmActionRequest req, string action, string perm, HttpContext http,
         NpgsqlDataSource ds, RealtimeService rt, CommandOptions o, Audit audit, CancellationToken ct)
     {
         if (req.Ids is not { Length: > 0 }) return Results.Problem("Не выбраны тревоги", statusCode: 400);
+        // квитирование и снятие с контроля — по области тревоги
+        var access = http.RequestServices.GetRequiredService<AccessService>();
+        var runtime = await access.RuntimeAsync(ct);
+        var perms = await http.PermsAsync();
+        var foreign = req.Ids.Where(id => !perms.Has(perm, runtime.AlarmArea(id))).ToArray();
+        if (foreign.Length > 0)
+        {
+            await audit.WriteAsync(http, "access_denied", "alarms:" + string.Join(',', foreign.Take(50)), new { perm, action });
+            return Results.Problem($"Нет права «{Perm.Names[perm]}» на часть выбранных тревог ({foreign.Length})", statusCode: 403);
+        }
         if (!AcquisitionAlive(rt, o)) return Results.Problem("Служба сбора недоступна", statusCode: 503);
         var payload = JsonSerializer.Serialize(
             new AlarmAckRequest(req.Ids.Take(500).ToArray(), http.User.Login(), req.Comment, action, req.Minutes),

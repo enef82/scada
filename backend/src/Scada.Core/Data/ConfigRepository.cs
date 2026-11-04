@@ -30,12 +30,12 @@ public static class Db
 public static class ConfigRepository
 {
     public const string DeviceColumns =
-        "id, name, protocol, endpoint, settings::text, enabled, poll_ms, timeout_ms, description";
+        "id, name, protocol, endpoint, settings::text, enabled, poll_ms, timeout_ms, description, area_id";
 
     public const string TagColumns =
         "id, name, description, device_id, address, data_type, unit, raw_low, raw_high, eng_low, eng_high, " +
         "poll_ms, stale_after_ms, deadband_ui, deadband_archive, archive_mode, archive_interval_s, " +
-        "writable, write_min, write_max, write_confirm, enabled";
+        "writable, write_min, write_max, write_confirm, enabled, area_id, command_class";
 
     public const string AlarmColumns =
         "id, tag_id, kind, limit_value, hysteresis, delay_ms, priority, message, enabled";
@@ -72,6 +72,7 @@ public static class ConfigRepository
         PollMs = r.GetInt32(6),
         TimeoutMs = r.GetInt32(7),
         Description = r.GetString(8),
+        AreaId = r.GetInt32(9),
     };
 
     public static TagDefinition ReadTag(DbDataReader r) => new()
@@ -98,6 +99,8 @@ public static class ConfigRepository
         WriteMax = r.GetNullableDouble(19),
         WriteConfirm = r.GetBoolean(20),
         Enabled = r.GetBoolean(21),
+        AreaId = r.GetNullableInt(22),
+        CommandClass = EnumCodes.ParseCommandClass(r.GetString(23)),
     };
 
     public static AlarmDefinition ReadAlarm(DbDataReader r) => new()

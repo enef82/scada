@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Npgsql;
+using Scada.Core.Access;
 using Scada.Core.Config;
 using Scada.Core.Data;
 using Scada.Web.Infrastructure;
@@ -12,13 +13,14 @@ public sealed record DeviceDto(
     int Id, string Name, string Protocol, string Endpoint, JsonElement Settings, bool Enabled,
     int PollMs, int TimeoutMs, string Description,
     string? State = null, DateTime? LastOkAt = null, string? LastError = null, long? ErrorCount = null,
-    double? AvgLatencyMs = null, int RowVersion = 0);
+    double? AvgLatencyMs = null, int RowVersion = 0, int AreaId = 1);
 
 public sealed record TagDto(
     int Id, string Name, string Description, int DeviceId, string Address, string DataType, string Unit,
     double? RawLow, double? RawHigh, double? EngLow, double? EngHigh, int? PollMs, int? StaleAfterMs,
     double DeadbandUi, double DeadbandArchive, string ArchiveMode, int ArchiveIntervalS,
-    bool Writable, double? WriteMin, double? WriteMax, bool WriteConfirm, bool Enabled, int RowVersion = 0);
+    bool Writable, double? WriteMin, double? WriteMax, bool WriteConfirm, bool Enabled, int RowVersion = 0,
+    int? AreaId = null, string CommandClass = "normal", int EffectiveAreaId = 0);
 
 public sealed record AlarmDefDto(
     int Id, int TagId, string Kind, double? LimitValue, double Hysteresis, int DelayMs, short Priority,
@@ -32,63 +34,77 @@ public sealed record AlarmDefDto(
 public static class ConfigApi
 {
     private const string TagSelect =
-        "SELECT id, name, description, device_id, address, data_type, unit, raw_low, raw_high, eng_low, eng_high, " +
-        "poll_ms, stale_after_ms, deadband_ui, deadband_archive, archive_mode, archive_interval_s, " +
-        "writable, write_min, write_max, write_confirm, enabled, row_version FROM tags";
+        "SELECT t.id, t.name, t.description, t.device_id, t.address, t.data_type, t.unit, t.raw_low, t.raw_high, t.eng_low, t.eng_high, " +
+        "t.poll_ms, t.stale_after_ms, t.deadband_ui, t.deadband_archive, t.archive_mode, t.archive_interval_s, " +
+        "t.writable, t.write_min, t.write_max, t.write_confirm, t.enabled, t.row_version, t.area_id, t.command_class, " +
+        "coalesce(t.area_id, d.area_id) FROM tags t JOIN devices d ON d.id = t.device_id";
+
+    private static readonly string[] CommandClasses = ["normal", "important", "critical"];
 
     private static TagDto ReadTag(System.Data.Common.DbDataReader r) => new(
         r.GetInt32(0), r.GetString(1), r.GetString(2), r.GetInt32(3), r.GetString(4), r.GetString(5), r.GetString(6),
         r.GetNullableDouble(7), r.GetNullableDouble(8), r.GetNullableDouble(9), r.GetNullableDouble(10),
         r.GetNullableInt(11), r.GetNullableInt(12), r.GetDouble(13), r.GetDouble(14), r.GetString(15), r.GetInt32(16),
-        r.GetBoolean(17), r.GetNullableDouble(18), r.GetNullableDouble(19), r.GetBoolean(20), r.GetBoolean(21), r.GetInt32(22));
+        r.GetBoolean(17), r.GetNullableDouble(18), r.GetNullableDouble(19), r.GetBoolean(20), r.GetBoolean(21), r.GetInt32(22),
+        r.GetNullableInt(23), r.GetString(24), r.GetInt32(25));
+
+    private static readonly string View = Policies.Of(Perm.View);
+    private static readonly string Edit = Policies.Of(Perm.ConfigEdit);
 
     public static void Map(RouteGroupBuilder api)
     {
         // ------------------------------------------------------------ устройства
-        api.MapGet("/devices", async (NpgsqlDataSource ds, CancellationToken ct) =>
+        api.MapGet("/devices", async (HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
             await ds.QueryAsync(
                 """
                 SELECT d.id, d.name, d.protocol, d.endpoint, d.settings::text, d.enabled, d.poll_ms, d.timeout_ms, d.description,
-                       s.state, s.last_ok_at, s.last_error, s.error_count, s.avg_latency_ms, d.row_version
-                FROM devices d LEFT JOIN device_status s ON s.device_id = d.id WHERE NOT d.deleted ORDER BY d.name
+                       s.state, s.last_ok_at, s.last_error, s.error_count, s.avg_latency_ms, d.row_version, d.area_id
+                FROM devices d LEFT JOIN device_status s ON s.device_id = d.id
+                WHERE NOT d.deleted AND ($1::int[] IS NULL OR d.area_id = ANY($1)) ORDER BY d.name
                 """,
                 r => new DeviceDto(r.GetInt32(0), r.GetString(1), r.GetString(2), r.GetString(3),
                     JsonSerializer.Deserialize<JsonElement>(r.GetString(4)), r.GetBoolean(5), r.GetInt32(6), r.GetInt32(7),
                     r.GetString(8), r.GetNullableString(9), r.GetNullableDateTime(10), r.GetNullableString(11),
-                    r.IsDBNull(12) ? null : r.GetInt64(12), r.GetNullableDouble(13), r.GetInt32(14)), ct))
-            .RequireAuthorization(Roles.CanView);
+                    r.IsDBNull(12) ? null : r.GetInt64(12), r.GetNullableDouble(13), r.GetInt32(14), r.GetInt32(15)), ct,
+                (await http.PermsAsync()).AreasOrAll(Perm.View)))
+            .RequireAuthorization(View);
 
         api.MapPost("/devices", (DeviceDto d, HttpContext http, NpgsqlDataSource ds, Audit audit, CancellationToken ct) =>
             Guard(async () =>
             {
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, d.AreaId, "device:new") is { } denied) return denied;
                 var id = Convert.ToInt32(await ds.ScalarAsync(
-                    "INSERT INTO devices (name, protocol, endpoint, settings, enabled, poll_ms, timeout_ms, description) " +
-                    "VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8) RETURNING id", ct,
+                    "INSERT INTO devices (name, protocol, endpoint, settings, enabled, poll_ms, timeout_ms, description, area_id) " +
+                    "VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9) RETURNING id", ct,
                     d.Name.Trim(), d.Protocol, d.Endpoint.Trim(), SettingsText(d.Settings), d.Enabled, d.PollMs, d.TimeoutMs,
-                    d.Description));
+                    d.Description, d.AreaId));
                 await DraftLog.WriteAsync(ds, http, "device", id, d.Name.Trim(), "create", ct);
                 await audit.WriteAsync(http, "config_change", $"device:{id}", new { op = "create", draft = true, device = d });
                 return Results.Ok(new { id });
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapPut("/devices/{id:int}", (int id, DeviceDto d, HttpContext http, NpgsqlDataSource ds, Audit audit,
+        api.MapPut("/devices/{id:int}", (int id, DeviceDto d, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit,
             CancellationToken ct) => Guard(async () =>
             {
+                // право нужно и на прежнюю, и на новую область
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftDeviceAreaAsync(id, ct), $"device:{id}") is { } denied) return denied;
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, d.AreaId, $"device:{id}") is { } denied2) return denied2;
                 var n = await ds.ExecAsync(
                     "UPDATE devices SET name=$2, protocol=$3, endpoint=$4, settings=$5::jsonb, enabled=$6, poll_ms=$7, " +
-                    "timeout_ms=$8, description=$9, row_version=row_version+1, updated_at=now() " +
+                    "timeout_ms=$8, description=$9, area_id=$11, row_version=row_version+1, updated_at=now() " +
                     "WHERE id=$1 AND NOT deleted AND ($10 = 0 OR row_version = $10)", ct,
                     id, d.Name.Trim(), d.Protocol, d.Endpoint.Trim(), SettingsText(d.Settings), d.Enabled, d.PollMs,
-                    d.TimeoutMs, d.Description, d.RowVersion);
+                    d.TimeoutMs, d.Description, d.RowVersion, d.AreaId);
                 if (n == 0) return await NotFoundOrConflict(ds, "devices", id, ct);
                 await DraftLog.WriteAsync(ds, http, "device", id, d.Name.Trim(), "update", ct);
                 await audit.WriteAsync(http, "config_change", $"device:{id}", new { op = "update", draft = true, device = d });
                 return Results.NoContent();
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapDelete("/devices/{id:int}", (int id, HttpContext http, NpgsqlDataSource ds, Audit audit, CancellationToken ct) =>
+        api.MapDelete("/devices/{id:int}", (int id, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit, CancellationToken ct) =>
             Guard(async () =>
             {
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftDeviceAreaAsync(id, ct), $"device:{id}") is { } denied) return denied;
                 var name = (string?)await ds.ScalarAsync("SELECT name FROM devices WHERE id=$1 AND NOT deleted", ct, id);
                 if (name is null) return Results.NotFound();
                 var tags = Convert.ToInt64(await ds.ScalarAsync("SELECT count(*) FROM tags WHERE device_id=$1 AND NOT deleted", ct, id));
@@ -97,51 +113,60 @@ public static class ConfigApi
                 await DraftLog.WriteAsync(ds, http, "device", id, name, "delete", ct);
                 await audit.WriteAsync(http, "config_change", $"device:{id}", new { op = "delete", draft = true });
                 return Results.NoContent();
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
         // ------------------------------------------------------------ теги
-        api.MapGet("/tags", async (int? deviceId, NpgsqlDataSource ds, CancellationToken ct) =>
-            await ds.QueryAsync(TagSelect + " WHERE NOT deleted AND ($1::int IS NULL OR device_id = $1) ORDER BY name", ReadTag, ct, deviceId))
-            .RequireAuthorization(Roles.CanView);
+        api.MapGet("/tags", async (int? deviceId, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
+            await ds.QueryAsync(TagSelect + " WHERE NOT t.deleted AND ($1::int IS NULL OR t.device_id = $1) " +
+                "AND ($2::int[] IS NULL OR coalesce(t.area_id, d.area_id) = ANY($2)) ORDER BY t.name", ReadTag, ct,
+                deviceId, (await http.PermsAsync()).AreasOrAll(Perm.View)))
+            .RequireAuthorization(View);
 
-        api.MapGet("/tags/{id:int}", async (int id, NpgsqlDataSource ds, CancellationToken ct) =>
-            await ds.QuerySingleAsync(TagSelect + " WHERE id = $1 AND NOT deleted", ReadTag, ct, id) is { } t ? Results.Ok(t) : Results.NotFound())
-            .RequireAuthorization(Roles.CanView);
+        api.MapGet("/tags/{id:int}", async (int id, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
+            await ds.QuerySingleAsync(TagSelect + " WHERE t.id = $1 AND NOT t.deleted", ReadTag, ct, id) is { } t
+                && (await http.PermsAsync()).Has(Perm.View, t.EffectiveAreaId) ? Results.Ok(t) : Results.NotFound())
+            .RequireAuthorization(View);
 
-        api.MapPost("/tags", (TagDto t, HttpContext http, NpgsqlDataSource ds, Audit audit, CancellationToken ct) =>
+        api.MapPost("/tags", (TagDto t, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit, CancellationToken ct) =>
             Guard(async () =>
             {
+                if (!CommandClasses.Contains(t.CommandClass)) return Results.Problem("Неизвестный класс критичности", statusCode: 400);
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, t.AreaId ?? await access.DraftDeviceAreaAsync(t.DeviceId, ct), "tag:new") is { } denied) return denied;
                 var id = Convert.ToInt32(await ds.ScalarAsync(
                     "INSERT INTO tags (name, description, device_id, address, data_type, unit, raw_low, raw_high, eng_low, " +
                     "eng_high, poll_ms, stale_after_ms, deadband_ui, deadband_archive, archive_mode, archive_interval_s, " +
-                    "writable, write_min, write_max, write_confirm, enabled) VALUES " +
-                    "($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id",
+                    "writable, write_min, write_max, write_confirm, enabled, area_id, command_class) VALUES " +
+                    "($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING id",
                     ct, TagArgs(t)));
                 await DraftLog.WriteAsync(ds, http, "tag", id, t.Name.Trim(), "create", ct);
                 await audit.WriteAsync(http, "config_change", $"tag:{id}", new { op = "create", draft = true, tag = t });
                 return Results.Ok(new { id });
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapPut("/tags/{id:int}", (int id, TagDto t, HttpContext http, NpgsqlDataSource ds, Audit audit,
+        api.MapPut("/tags/{id:int}", (int id, TagDto t, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit,
             CancellationToken ct) => Guard(async () =>
             {
+                if (!CommandClasses.Contains(t.CommandClass)) return Results.Problem("Неизвестный класс критичности", statusCode: 400);
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftTagAreaAsync(id, ct), $"tag:{id}") is { } denied) return denied;
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, t.AreaId ?? await access.DraftDeviceAreaAsync(t.DeviceId, ct), $"tag:{id}") is { } denied2) return denied2;
                 var args = new List<object?>(TagArgs(t)) { id, t.RowVersion };
                 var n = await ds.ExecAsync(
                     "UPDATE tags SET name=$1, description=$2, device_id=$3, address=$4, data_type=$5, unit=$6, raw_low=$7, " +
                     "raw_high=$8, eng_low=$9, eng_high=$10, poll_ms=$11, stale_after_ms=$12, deadband_ui=$13, " +
                     "deadband_archive=$14, archive_mode=$15, archive_interval_s=$16, writable=$17, write_min=$18, " +
-                    "write_max=$19, write_confirm=$20, enabled=$21, row_version=row_version+1, updated_at=now() " +
-                    "WHERE id=$22 AND NOT deleted AND ($23 = 0 OR row_version = $23)",
+                    "write_max=$19, write_confirm=$20, enabled=$21, area_id=$22, command_class=$23, row_version=row_version+1, updated_at=now() " +
+                    "WHERE id=$24 AND NOT deleted AND ($25 = 0 OR row_version = $25)",
                     ct, args.ToArray());
                 if (n == 0) return await NotFoundOrConflict(ds, "tags", id, ct);
                 await DraftLog.WriteAsync(ds, http, "tag", id, t.Name.Trim(), "update", ct);
                 await audit.WriteAsync(http, "config_change", $"tag:{id}", new { op = "update", draft = true, tag = t });
                 return Results.NoContent();
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapDelete("/tags/{id:int}", (int id, HttpContext http, NpgsqlDataSource ds, Audit audit, CancellationToken ct) =>
+        api.MapDelete("/tags/{id:int}", (int id, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit, CancellationToken ct) =>
             Guard(async () =>
             {
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftTagAreaAsync(id, ct), $"tag:{id}") is { } denied) return denied;
                 var name = (string?)await ds.ScalarAsync("SELECT name FROM tags WHERE id=$1 AND NOT deleted", ct, id);
                 if (name is null) return Results.NotFound();
                 var alarms = Convert.ToInt64(await ds.ScalarAsync("SELECT count(*) FROM alarm_defs WHERE tag_id=$1 AND NOT deleted", ct, id));
@@ -150,39 +175,45 @@ public static class ConfigApi
                 await DraftLog.WriteAsync(ds, http, "tag", id, name, "delete", ct);
                 await audit.WriteAsync(http, "config_change", $"tag:{id}", new { op = "delete", draft = true });
                 return Results.NoContent();
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapGet("/tags/export", async (NpgsqlDataSource ds, HttpContext http, Audit audit, CancellationToken ct) =>
+        api.MapGet("/tags/export", async (NpgsqlDataSource ds, HttpContext http, AccessService access, Audit audit, CancellationToken ct) =>
         {
-            var csv = await TagCsv.ExportAsync(ds, ct);
+            var csv = await TagCsv.ExportAsync(ds, (await access.ModelAsync(ct)).Tree, (await http.PermsAsync()).AreasOrAll(Perm.View), ct);
             await audit.WriteAsync(http, "export", "tags", null);
             // BOM — чтобы Excel корректно открыл кириллицу
             return Results.File(Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(csv)).ToArray(),
                 "text/csv; charset=utf-8", "tags.csv");
-        }).RequireAuthorization(Roles.CanEngineer);
+        }).RequireAuthorization(Edit);
 
-        api.MapPost("/tags/import", async (HttpRequest req, HttpContext http, NpgsqlDataSource ds, Audit audit,
+        api.MapPost("/tags/import", async (HttpRequest req, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit,
             CancellationToken ct) =>
         {
             using var reader = new StreamReader(req.Body, Encoding.UTF8);
             var text = await reader.ReadToEndAsync(ct);
-            var report = await TagCsv.ImportAsync(ds, text, http.User.Login(), ct);
+            var perms = await http.PermsAsync();
+            var report = await TagCsv.ImportAsync(ds, text, http.User.Login(), (await access.ModelAsync(ct)).Tree,
+                area => perms.Has(Perm.ConfigEdit, area), ct);
             await audit.WriteAsync(http, "import", "tags", new { report.Inserted, report.Updated, errors = report.Errors.Count, draft = true });
             return report.Errors.Count > 0 ? Results.BadRequest(report) : Results.Ok(report);
-        }).RequireAuthorization(Roles.CanEngineer);
+        }).RequireAuthorization(Edit);
 
         // ------------------------------------------------------------ определения тревог
-        api.MapGet("/alarm-defs", async (int? tagId, NpgsqlDataSource ds, CancellationToken ct) =>
+        api.MapGet("/alarm-defs", async (int? tagId, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
             await ds.QueryAsync(
-                "SELECT id, tag_id, kind, limit_value, hysteresis, delay_ms, priority, message, enabled, row_version FROM alarm_defs " +
-                "WHERE NOT deleted AND ($1::int IS NULL OR tag_id = $1) ORDER BY tag_id, priority",
+                "SELECT a.id, a.tag_id, a.kind, a.limit_value, a.hysteresis, a.delay_ms, a.priority, a.message, a.enabled, a.row_version " +
+                "FROM alarm_defs a JOIN tags t ON t.id = a.tag_id JOIN devices d ON d.id = t.device_id " +
+                "WHERE NOT a.deleted AND ($1::int IS NULL OR a.tag_id = $1) AND ($2::int[] IS NULL OR coalesce(t.area_id, d.area_id) = ANY($2)) " +
+                "ORDER BY a.tag_id, a.priority",
                 r => new AlarmDefDto(r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetNullableDouble(3), r.GetDouble(4),
-                    r.GetInt32(5), r.GetInt16(6), r.GetString(7), r.GetBoolean(8), r.GetInt32(9)), ct, tagId))
-            .RequireAuthorization(Roles.CanView);
+                    r.GetInt32(5), r.GetInt16(6), r.GetString(7), r.GetBoolean(8), r.GetInt32(9)), ct, tagId,
+                (await http.PermsAsync()).AreasOrAll(Perm.View)))
+            .RequireAuthorization(View);
 
-        api.MapPost("/alarm-defs", (AlarmDefDto a, HttpContext http, NpgsqlDataSource ds, Audit audit, CancellationToken ct) =>
+        api.MapPost("/alarm-defs", (AlarmDefDto a, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit, CancellationToken ct) =>
             Guard(async () =>
             {
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftTagAreaAsync(a.TagId, ct), "alarm_def:new") is { } denied) return denied;
                 var id = Convert.ToInt32(await ds.ScalarAsync(
                     "INSERT INTO alarm_defs (tag_id, kind, limit_value, hysteresis, delay_ms, priority, message, enabled) " +
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id", ct,
@@ -190,11 +221,13 @@ public static class ConfigApi
                 await DraftLog.WriteAsync(ds, http, "alarm", id, a.Message, "create", ct);
                 await audit.WriteAsync(http, "config_change", $"alarm_def:{id}", new { op = "create", draft = true, alarm = a });
                 return Results.Ok(new { id });
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapPut("/alarm-defs/{id:int}", (int id, AlarmDefDto a, HttpContext http, NpgsqlDataSource ds, Audit audit,
+        api.MapPut("/alarm-defs/{id:int}", (int id, AlarmDefDto a, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit,
             CancellationToken ct) => Guard(async () =>
             {
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftAlarmAreaAsync(id, ct), $"alarm_def:{id}") is { } denied) return denied;
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftTagAreaAsync(a.TagId, ct), $"alarm_def:{id}") is { } denied2) return denied2;
                 var n = await ds.ExecAsync(
                     "UPDATE alarm_defs SET tag_id=$2, kind=$3, limit_value=$4, hysteresis=$5, delay_ms=$6, priority=$7, " +
                     "message=$8, enabled=$9, row_version=row_version+1, updated_at=now() " +
@@ -204,18 +237,19 @@ public static class ConfigApi
                 await DraftLog.WriteAsync(ds, http, "alarm", id, a.Message, "update", ct);
                 await audit.WriteAsync(http, "config_change", $"alarm_def:{id}", new { op = "update", draft = true, alarm = a });
                 return Results.NoContent();
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
 
-        api.MapDelete("/alarm-defs/{id:int}", (int id, HttpContext http, NpgsqlDataSource ds, Audit audit,
+        api.MapDelete("/alarm-defs/{id:int}", (int id, HttpContext http, NpgsqlDataSource ds, AccessService access, Audit audit,
             CancellationToken ct) => Guard(async () =>
             {
+                if (await http.DenyUnlessAsync(Perm.ConfigEdit, await access.DraftAlarmAreaAsync(id, ct), $"alarm_def:{id}") is { } denied) return denied;
                 var msg = (string?)await ds.ScalarAsync("SELECT message FROM alarm_defs WHERE id=$1 AND NOT deleted", ct, id);
                 if (msg is null) return Results.NotFound();
                 await SoftDelete(ds, "alarm_defs", id, ct);
                 await DraftLog.WriteAsync(ds, http, "alarm", id, msg, "delete", ct);
                 await audit.WriteAsync(http, "config_change", $"alarm_def:{id}", new { op = "delete", draft = true });
                 return Results.NoContent();
-            })).RequireAuthorization(Roles.CanEngineer);
+            })).RequireAuthorization(Edit);
     }
 
     public static async Task SoftDelete(NpgsqlDataSource ds, string table, int id, CancellationToken ct)
@@ -241,6 +275,7 @@ public static class ConfigApi
         t.Name.Trim(), t.Description, t.DeviceId, t.Address.Trim(), t.DataType, t.Unit, t.RawLow, t.RawHigh,
         t.EngLow, t.EngHigh, t.PollMs, t.StaleAfterMs, t.DeadbandUi, t.DeadbandArchive, t.ArchiveMode,
         t.ArchiveIntervalS, t.Writable, t.WriteMin, t.WriteMax, t.WriteConfirm, t.Enabled,
+        t.AreaId is > 0 ? t.AreaId : null, t.CommandClass,
     ];
 
     /// <summary>Нарушения ограничений БД → 400/409 с понятным текстом.</summary>
@@ -263,25 +298,28 @@ public static class TagCsv
     [
         "name", "description", "device", "address", "data_type", "unit", "raw_low", "raw_high", "eng_low", "eng_high",
         "poll_ms", "stale_after_ms", "deadband_ui", "deadband_archive", "archive_mode", "archive_interval_s",
-        "writable", "write_min", "write_max", "write_confirm", "enabled",
+        "writable", "write_min", "write_max", "write_confirm", "enabled", "area", "command_class",
     ];
 
     public sealed record ImportReport(int Inserted, int Updated, List<string> Errors);
 
-    public static async Task<string> ExportAsync(NpgsqlDataSource ds, CancellationToken ct)
+    /// <summary>Колонка area — путь области («Установка / Водоотведение / КНС-1»); пусто — область устройства.</summary>
+    public static async Task<string> ExportAsync(NpgsqlDataSource ds, AreaTree tree, int[]? areas, CancellationToken ct)
     {
         var rows = await ds.QueryAsync(
             "SELECT t.name, t.description, d.name, t.address, t.data_type, t.unit, t.raw_low, t.raw_high, t.eng_low, " +
             "t.eng_high, t.poll_ms, t.stale_after_ms, t.deadband_ui, t.deadband_archive, t.archive_mode, " +
-            "t.archive_interval_s, t.writable, t.write_min, t.write_max, t.write_confirm, t.enabled " +
-            "FROM tags t JOIN devices d ON d.id = t.device_id WHERE NOT t.deleted ORDER BY t.name",
+            "t.archive_interval_s, t.writable, t.write_min, t.write_max, t.write_confirm, t.enabled, t.area_id, t.command_class " +
+            "FROM tags t JOIN devices d ON d.id = t.device_id WHERE NOT t.deleted " +
+            "AND ($1::int[] IS NULL OR coalesce(t.area_id, d.area_id) = ANY($1)) ORDER BY t.name",
             r =>
             {
                 var cells = new string[r.FieldCount];
                 for (var i = 0; i < r.FieldCount; i++)
-                    cells[i] = r.IsDBNull(i) ? "" : Convert.ToString(r.GetValue(i), CultureInfo.InvariantCulture)!.ToLowerInvariantIfBool();
+                    cells[i] = r.IsDBNull(i) ? "" : i == 21 ? tree.Path(r.GetInt32(i))
+                        : Convert.ToString(r.GetValue(i), CultureInfo.InvariantCulture)!.ToLowerInvariantIfBool();
                 return string.Join(';', cells.Select(Escape));
-            }, ct);
+            }, ct, areas);
         return string.Join(';', Columns) + "\n" + string.Join("\n", rows) + "\n";
     }
 
@@ -325,8 +363,10 @@ public static class TagCsv
         return rows;
     }
 
-    public static async Task<ImportReport> ImportAsync(NpgsqlDataSource ds, string text, string user, CancellationToken ct)
+    public static async Task<ImportReport> ImportAsync(NpgsqlDataSource ds, string text, string user, AreaTree tree,
+        Func<int, bool> canEdit, CancellationToken ct)
     {
+        var areaByPath = tree.Nodes.ToDictionary(n => tree.Path(n.Id), n => n.Id, StringComparer.OrdinalIgnoreCase);
         var errors = new List<string>();
         var rows = Parse(text.TrimStart('﻿'));
         if (rows.Count == 0) return new ImportReport(0, 0, ["Файл пуст"]);
@@ -337,8 +377,13 @@ public static class TagCsv
             if (idx[req] < 0) errors.Add($"Нет обязательной колонки «{req}»");
         if (errors.Count > 0) return new ImportReport(0, 0, errors);
 
-        var devices = await ds.QueryAsync("SELECT name, id FROM devices WHERE NOT deleted", r => (r.GetString(0), r.GetInt32(1)), ct);
+        var devices = await ds.QueryAsync("SELECT name, id, area_id FROM devices WHERE NOT deleted", r => (r.GetString(0), r.GetInt32(1), r.GetInt32(2)), ct);
         var devByName = devices.ToDictionary(d => d.Item1, d => d.Item2, StringComparer.OrdinalIgnoreCase);
+        var devArea = devices.ToDictionary(d => d.Item2, d => d.Item3);
+        // существующий тег чужой области перезаписать импортом нельзя
+        var existing = (await ds.QueryAsync(
+            "SELECT t.name, coalesce(t.area_id, d.area_id) FROM tags t JOIN devices d ON d.id = t.device_id WHERE NOT t.deleted",
+            r => (r.GetString(0), r.GetInt32(1)), ct)).ToDictionary(x => x.Item1, x => x.Item2, StringComparer.Ordinal);
 
         await using var conn = await ds.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
@@ -364,13 +409,27 @@ public static class TagCsv
             {
                 if (!devByName.TryGetValue(Get("device"), out var devId))
                     throw new FormatException($"устройство «{Get("device")}» не найдено");
+                int? areaId = null;
+                if (Get("area") is { Length: > 0 } ap)
+                {
+                    if (!areaByPath.TryGetValue(ap, out var aid) && !(int.TryParse(ap, out aid) && tree.Contains(aid)))
+                        throw new FormatException($"область «{ap}» не найдена (укажите путь, например «{tree.Path(tree.RootId)} / …»)");
+                    areaId = aid;
+                }
+                var cls = Get("command_class") is { Length: > 0 } c ? c : "normal";
+                if (cls is not ("normal" or "important" or "critical"))
+                    throw new FormatException($"класс «{cls}»: допустимо normal, important, critical");
+                if (existing.TryGetValue(Get("name"), out var oldArea) && !canEdit(oldArea))
+                    throw new FormatException($"тег уже есть в области «{tree.Path(oldArea)}», на которую нет права «Конфигурация»");
+                if (!canEdit(areaId ?? devArea[devId]))
+                    throw new FormatException($"нет права «Конфигурация» на область «{tree.Path(areaId ?? devArea[devId])}»");
 
                 await using var cmd = new NpgsqlCommand(
                     """
                     INSERT INTO tags (name, description, device_id, address, data_type, unit, raw_low, raw_high, eng_low,
                         eng_high, poll_ms, stale_after_ms, deadband_ui, deadband_archive, archive_mode, archive_interval_s,
-                        writable, write_min, write_max, write_confirm, enabled)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                        writable, write_min, write_max, write_confirm, enabled, area_id, command_class)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
                     ON CONFLICT (name) DO UPDATE SET description=EXCLUDED.description, device_id=EXCLUDED.device_id,
                         address=EXCLUDED.address, data_type=EXCLUDED.data_type, unit=EXCLUDED.unit,
                         raw_low=EXCLUDED.raw_low, raw_high=EXCLUDED.raw_high, eng_low=EXCLUDED.eng_low,
@@ -379,6 +438,7 @@ public static class TagCsv
                         archive_mode=EXCLUDED.archive_mode, archive_interval_s=EXCLUDED.archive_interval_s,
                         writable=EXCLUDED.writable, write_min=EXCLUDED.write_min, write_max=EXCLUDED.write_max,
                         write_confirm=EXCLUDED.write_confirm, enabled=EXCLUDED.enabled,
+                        area_id=EXCLUDED.area_id, command_class=EXCLUDED.command_class,
                         row_version=tags.row_version+1, updated_at=now()
                     RETURNING (xmax = 0), id
                     """, conn, tx);
@@ -389,6 +449,7 @@ public static class TagCsv
                     D("deadband_ui") ?? 0, D("deadband_archive") ?? 0,
                     Get("archive_mode") is { Length: > 0 } m ? m : "change", I("archive_interval_s") ?? 60,
                     B("writable", false), D("write_min"), D("write_max"), B("write_confirm", true), B("enabled", true),
+                    areaId, cls,
                 ];
                 foreach (var a in args) cmd.Parameters.Add(Db.P(a));
 

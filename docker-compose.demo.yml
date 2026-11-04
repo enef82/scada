@@ -3,3 +3,4 @@ services:
   db:
     volumes:
       - ./db/002_demo.sql:/docker-entrypoint-initdb.d/002_demo.sql:ro
+      - ./db/006_demo_access.sql:/docker-entrypoint-initdb.d/006_demo_access.sql:ro

@@ -21,7 +21,7 @@ public static class ConfigDiff
     private static readonly HashSet<string> Sensitive = new(StringComparer.OrdinalIgnoreCase)
     {
         "address", "endpoint", "protocol", "writable", "writeMin", "writeMax", "writeConfirm", "deviceId",
-        "rawLow", "rawHigh", "engLow", "engHigh", "enabled",
+        "rawLow", "rawHigh", "engLow", "engHigh", "enabled", "areaId", "commandClass",
     };
 
     public static List<ChangeItem> Compute(ConfigSnapshot prev, ConfigSnapshot next)
@@ -76,4 +76,22 @@ public static class ConfigDiff
     public static Dictionary<string, Dictionary<string, int>> Summary(IEnumerable<ChangeItem> changes) =>
         changes.GroupBy(c => c.ObjectType)
             .ToDictionary(g => g.Key, g => g.GroupBy(c => c.Op).ToDictionary(x => x.Key, x => x.Count()));
+
+    /// <summary>Области, которые затрагивает изменение: прежняя и новая (перенос объекта между областями).</summary>
+    public static int[] ChangeAreas(ChangeItem c, ConfigSnapshot prev, ConfigSnapshot next)
+    {
+        IEnumerable<int> In(ConfigSnapshot s) => c.ObjectType switch
+        {
+            "device" => s.Devices.Where(d => d.Id == c.Id).Select(d => d.AreaId),
+            "tag" => s.Tags.Where(t => t.Id == c.Id).Select(s.TagArea),
+            "alarm" => s.Alarms.Where(a => a.Id == c.Id).SelectMany(a => s.Tags.Where(t => t.Id == a.TagId)).Select(s.TagArea),
+            "mnemo" => s.Mnemos.Where(m => m.Id == c.Id).Select(m => m.AreaId),
+            _ => [],
+        };
+        // перенос устройства меняет область всех его тегов без собственной области
+        var extra = c.ObjectType == "device"
+            ? prev.Tags.Concat(next.Tags).Where(t => t.DeviceId == c.Id && t.AreaId is null).SelectMany(t => new[] { prev.TagArea(t), next.TagArea(t) })
+            : [];
+        return In(prev).Concat(In(next)).Concat(extra).Select(a => a > 0 ? a : 1).Distinct().ToArray();
+    }
 }

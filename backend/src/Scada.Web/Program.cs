@@ -20,6 +20,13 @@ builder.Services.Configure<RealtimeOptions>(builder.Configuration.GetSection("Re
 builder.Services.Configure<PublishOptions>(builder.Configuration.GetSection("Publishing"));
 builder.Services.AddSingleton<PublishService>();
 
+builder.Services.Configure<DirectoryOptions>(builder.Configuration.GetSection("Directory"));
+builder.Services.AddSingleton<IDirectory, LdapDirectory>();
+builder.Services.AddSingleton<Credentials>();
+builder.Services.AddSingleton<AccessService>();
+builder.Services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationPolicyProvider, PermissionPolicyProvider>();
+builder.Services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationHandler, PermissionHandler>();
+
 builder.Services.AddSingleton<Passwords>();
 builder.Services.AddSingleton<LoginThrottle>();
 builder.Services.AddSingleton<Audit>();
@@ -39,8 +46,10 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         // API: 401/403 вместо редиректа на страницу входа
         o.Events.OnRedirectToLogin = ctx => { ctx.Response.StatusCode = 401; return Task.CompletedTask; };
         o.Events.OnRedirectToAccessDenied = ctx => { ctx.Response.StatusCode = 403; return Task.CompletedTask; };
+        // группы AD перечитываются раз в 15 минут, отключённые записи теряют сеанс
+        o.Events.OnValidatePrincipal = AuthApi.ValidatePrincipalAsync;
     });
-builder.Services.AddAuthorization(Roles.AddPolicies);
+builder.Services.AddAuthorization();
 
 builder.Services.AddSignalR(o =>
 {
@@ -98,8 +107,10 @@ app.UseStaticFiles();
 app.UseAuthentication();
 app.UseAuthorization();
 
-var api = app.MapGroup("/api").RequireAuthorization(Roles.CanView);
+// по умолчанию — только вошедший пользователь; конкретное право задаёт каждая точка API
+var api = app.MapGroup("/api").RequireAuthorization();
 AuthApi.Map(api);
+AccessApi.Map(api);
 ConfigApi.Map(api);
 RuntimeApi.Map(api);
 MnemoApi.Map(api);

@@ -5,7 +5,7 @@ using Scada.Core.Model;
 namespace Scada.Core.Config;
 
 /// <summary>Ссылка на зафиксированную версию мнемосхемы (документы схем хранятся в mnemo_versions).</summary>
-public sealed record MnemoRef(int Id, string Name, int? ParentId, int SortOrder, int Version);
+public sealed record MnemoRef(int Id, string Name, int? ParentId, int SortOrder, int Version, int AreaId = 1);
 
 /// <summary>
 /// Полная конфигурация в одной точке времени: черновик или опубликованная версия.
@@ -20,6 +20,10 @@ public sealed record ConfigSnapshot(
     public static readonly ConfigSnapshot Empty = new([], [], [], []);
 
     public ScadaConfig ToRuntime() => new(Devices, Tags, Alarms);
+
+    /// <summary>Область тега: собственная или область устройства (0/неизвестно — корень).</summary>
+    public int TagArea(TagDefinition t) =>
+        t.AreaId is > 0 and var a ? a : Devices.FirstOrDefault(d => d.Id == t.DeviceId)?.AreaId is > 0 and var da ? da : 1;
 
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
